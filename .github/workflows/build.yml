@@ -23,7 +23,7 @@ on:
         default: ""
       turbo_headroom:
         description: "Turbo schedutil: off / normal (+25%) / strong (+50%)"
-        default: "normal"
+        default: "strong"
       bbr3_patch_url:
         description: "URL raw patch TCP BBRv3 untuk 5.10 (kosongkan untuk skip)"
         default: ""
@@ -50,13 +50,19 @@ on:
         description: "Compile -O3 (lebih kencang, build lebih lama, kecil kemungkinan gagal): on / off"
         type: choice
         options: ["off", "on"]
-        default: "off"
+        default: "on"
+      gpu_floor_pct:
+        description: "GPU Mali: lantai frekuensi min, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
+      min_floor_pct:
+        description: "EXTREME: lantai frekuensi min CPU permanen, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
       input_boost_ms:
         description: "Durasi touch boost default (ms, kosongkan untuk skip)"
-        default: "200"
+        default: "300"
       input_boost_pct:
         description: "Touch boost: persen max freq (1-100, kosongkan untuk skip)"
-        default: "90"
+        default: "100"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -145,6 +151,8 @@ jobs:
           #include <linux/irqnr.h>
           #include <linux/interrupt.h>
           #include <linux/nodemask.h>
+          #include <linux/fs.h>
+          #include <linux/kernel.h>
 
           static unsigned int boot_boost_ms = 60000;
           module_param(boot_boost_ms, uint, 0644);
@@ -152,6 +160,8 @@ jobs:
           module_param(input_boost_ms, uint, 0644);
           static unsigned int input_boost_pct = 80;
           module_param(input_boost_pct, uint, 0644);
+          static unsigned int min_floor_pct = 0;
+          module_param(min_floor_pct, uint, 0644);
 
           static unsigned int uname_uids[16];
           static int uname_nuids;
@@ -166,6 +176,8 @@ jobs:
           struct kz_pol {
               struct freq_qos_request boot_req;
               struct freq_qos_request input_req;
+              struct freq_qos_request floor_req;
+              bool floor_on;
               unsigned int max_freq;
               bool init;
           };
@@ -205,7 +217,12 @@ jobs:
                           freq_qos_remove_request(&kz[first].boot_req);
                           goto next;
                       }
-                      kz[first].init = true;
+                                if (min_floor_pct)
+                                    kz[first].floor_on = freq_qos_add_request(&p->constraints,
+                                            &kz[first].floor_req, FREQ_QOS_MIN,
+                                            p->cpuinfo.max_freq / 100 *
+                                            min_t(unsigned int, min_floor_pct, 100)) >= 0;
+                                kz[first].init = true;
                       pr_info("policy%u attached (max %u kHz)\n", first, kz[first].max_freq);
                   }
           next:
@@ -393,6 +410,83 @@ jobs:
               pr_info("kswapd/irq affinity applied\n");
           }
 
+          /* GPU (MediaTek Mali): GED boost toggles + devfreq min-freq floor, best effort. */
+          #define KZ_GPU_DEVFREQ "/sys/class/devfreq/13000000.mali"
+
+          static unsigned int gpu_floor_pct;
+          module_param(gpu_floor_pct, uint, 0644);
+
+          static struct delayed_work gpu_work;
+          static unsigned long gpu_deadline;
+          static bool gpu_toggles_done, gpu_floor_done;
+
+          static const struct {
+              const char *path;
+              const char *val;
+          } kz_ged[] = {
+              { "/sys/module/ged/parameters/boost_gpu_enable", "1" },
+              { "/sys/module/ged/parameters/ged_boost_enable", "1" },
+              { "/sys/module/ged/parameters/enable_gpu_boost", "1" },
+          };
+
+          static int kz_write_file(const char *path, const char *val)
+          {
+              struct file *f = filp_open(path, O_WRONLY, 0);
+              loff_t pos = 0;
+              ssize_t r;
+
+              if (IS_ERR(f))
+                  return PTR_ERR(f);
+              r = kernel_write(f, val, strlen(val), &pos);
+              filp_close(f, NULL);
+              return r < 0 ? (int)r : 0;
+          }
+
+          static int kz_read_ulong(const char *path, unsigned long *out)
+          {
+              struct file *f = filp_open(path, O_RDONLY, 0);
+              char buf[32] = { };
+              loff_t pos = 0;
+              ssize_t r;
+
+              if (IS_ERR(f))
+                  return PTR_ERR(f);
+              r = kernel_read(f, buf, sizeof(buf) - 1, &pos);
+              filp_close(f, NULL);
+              if (r <= 0)
+                  return r ? (int)r : -EIO;
+              return kstrtoul(buf, 10, out);
+          }
+
+          static void kz_gpu_fn(struct work_struct *w)
+          {
+              unsigned long maxf, target;
+              char buf[24];
+              int i, ok = 0;
+
+              if (!gpu_toggles_done) {
+                  for (i = 0; i < ARRAY_SIZE(kz_ged); i++)
+                      if (!kz_write_file(kz_ged[i].path, kz_ged[i].val))
+                          ok++;
+                  if (ok) {
+                      gpu_toggles_done = true;
+                      pr_info("GED boost toggles set (%d)\n", ok);
+                  }
+              }
+              if (gpu_floor_pct && !gpu_floor_done &&
+                  !kz_read_ulong(KZ_GPU_DEVFREQ "/max_freq", &maxf) && maxf) {
+                  target = maxf / 100 * min_t(unsigned int, gpu_floor_pct, 100);
+                  snprintf(buf, sizeof(buf), "%lu", target);
+                  if (!kz_write_file(KZ_GPU_DEVFREQ "/min_freq", buf)) {
+                      gpu_floor_done = true;
+                      pr_info("GPU floor set to %lu Hz\n", target);
+                  }
+              }
+              if ((!gpu_toggles_done || (gpu_floor_pct && !gpu_floor_done)) &&
+                  time_before(jiffies, gpu_deadline))
+                  schedule_delayed_work(&gpu_work, 5 * HZ);
+          }
+
           static int __init kz_init(void)
           {
               INIT_DELAYED_WORK(&attach_work, kz_attach_fn);
@@ -401,6 +495,9 @@ jobs:
               INIT_WORK(&input_on_work, kz_input_on_fn);
               INIT_DELAYED_WORK(&affinity_work, kz_affinity_fn);
               schedule_delayed_work(&affinity_work, 60 * HZ);
+              INIT_DELAYED_WORK(&gpu_work, kz_gpu_fn);
+              gpu_deadline = jiffies + 600 * HZ;
+              schedule_delayed_work(&gpu_work, 30 * HZ);
 
               if (!boot_boost_ms)
                   boot_active = false;
@@ -505,6 +602,42 @@ jobs:
           PYEOF
           grep -nE "input_boost_(ms|pct) =" drivers/misc/kaelltzyy.c
 
+      - name: Min freq floor default (extreme)
+        if: ${{ inputs.min_floor_pct != '' && inputs.min_floor_pct != '0' }}
+        env:
+          PCT: ${{ inputs.min_floor_pct }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          n = max(1, min(100, int(os.environ['PCT'])))
+          old = 'static unsigned int min_floor_pct = 0;'
+          assert old in s
+          s = s.replace(old, 'static unsigned int min_floor_pct = %d;' % n)
+          open(p, 'w').write(s)
+          print('min_floor_pct =', n)
+          PYEOF
+
+      - name: GPU floor default
+        if: ${{ inputs.gpu_floor_pct != '' && inputs.gpu_floor_pct != '0' }}
+        env:
+          PCT: ${{ inputs.gpu_floor_pct }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          n = max(1, min(100, int(os.environ['PCT'])))
+          old = 'static unsigned int gpu_floor_pct;'
+          assert old in s
+          s = s.replace(old, 'static unsigned int gpu_floor_pct = %d;' % n)
+          open(p, 'w').write(s)
+          print('gpu_floor_pct =', n)
+          PYEOF
+
       - name: Force ZRAM disksize
         if: ${{ inputs.zram_size_gb != '' && inputs.zram_size_gb != '0' }}
         env:
@@ -548,6 +681,98 @@ jobs:
           patch('mm/swap_state.c', [('static bool enable_vma_readahead __read_mostly = true;',
                                      'static bool enable_vma_readahead __read_mostly = false;')])
           patch('include/linux/mm.h', [('(SZ_128K / PAGE_SIZE)', '(SZ_512K / PAGE_SIZE)')])
+          PYEOF
+
+      - name: Clamp vfs_cache_pressure (tolak tulisan init > 50)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          p = 'kernel/sysctl.c'
+          s = open(p).read()
+          m = re.search(r'\.procname\s*=\s*"vfs_cache_pressure",', s)
+          assert m, 'entry vfs_cache_pressure tidak ditemukan'
+          end = s.index('},', m.end())
+          entry = s[m.start():end]
+          assert 'proc_dointvec_minmax' in entry, 'handler bukan minmax'
+          k = s.index('.extra1', m.end())
+          assert k < end, '.extra1 tidak ada di entry'
+          eol = s.index('\n', k)
+          s = s[:eol] + '\n\t\t.extra2\t\t= &kz_vfs_max,' + s[eol:]
+          t = s.index('static struct ctl_table vm_table[]')
+          s = s[:t] + 'static int kz_vfs_max = 50; /* Kaelltzyy */\n' + s[t:]
+          open(p, 'w').write(s)
+          print('vfs_cache_pressure di-clamp max 50')
+          PYEOF
+          grep -n "kz_vfs_max" kernel/sysctl.c
+
+      - name: Force ZRAM compressor lz4
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          p = 'drivers/block/zram/zram_drv.c'
+          s = open(p).read()
+          old = 'strlcpy(compressor, buf, sizeof(compressor));'
+          if old in s and 'Kaelltzyy lz4' not in s:
+              s = s.replace(old, old + ' strlcpy(compressor, "lz4", sizeof(compressor)); /* Kaelltzyy lz4 */', 1)
+              open(p, 'w').write(s)
+              print('zram comp_algorithm dipaksa lz4')
+          else:
+              print('::warning::baris comp_algorithm_store tidak ditemukan, lz4 hanya lewat default config')
+          PYEOF
+
+      - name: VM defaults (dirty, swappiness, min_free, OOM)
+        env:
+          SWAP_MAX: "20"
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os, re
+          def sub(path, pat, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print('::warning::file tidak ada:', path); return
+              n, c = re.subn(pat, repl, s, count=1)
+              if c:
+                  open(path, 'w').write(n); print('ok   ', label)
+              else:
+                  print('::warning::tidak ditemukan, dilewati:', label)
+
+          pw = 'mm/page-writeback.c'
+          sub(pw, r'(int\s+vm_dirty_ratio\s*=\s*)\d+;', r'\g<1>10;', 'dirty_ratio=10')
+          sub(pw, r'(int\s+dirty_background_ratio\s*=\s*)\d+;', r'\g<1>5;', 'dirty_background_ratio=5')
+          sub(pw, r'(dirty_writeback_interval\s*=\s*)[^;]+;', r'\g<1>3 * 100;', 'writeback 3s')
+          sub(pw, r'(dirty_expire_interval\s*=\s*)[^;]+;', r'\g<1>5 * 100;', 'dirty_expire 5s')
+
+          sw = os.environ['SWAP_MAX']
+          sub('mm/vmscan.c', r'(int\s+vm_swappiness\s*=\s*)\d+;', r'\g<1>' + sw + ';', 'swappiness default ' + sw)
+          sub('mm/page_alloc.c',
+              r'(new_min_free_kbytes\s*=\s*int_sqrt\(lowmem_kbytes\s*\*\s*16\))\s*;',
+              r'\g<1> + 5120; /* Kaelltzyy +5MB */', 'min_free_kbytes +5MB')
+          sub('mm/oom_kill.c', r'([ \t]*)/\* Normalize to oom_score_adj units \*/',
+              r'\g<1>points >>= 1; /* Kaelltzyy: halve base badness */\n\g<0>', 'oom badness /2')
+
+          # swappiness: batas atas (tolak tulisan > SWAP_MAX)
+          p = 'kernel/sysctl.c'
+          s = open(p).read()
+          m = re.search(r'\.procname\s*=\s*"swappiness",', s)
+          if m:
+              end = s.index('},', m.end())
+              entry = s[m.start():end]
+              if re.search(r'\.extra2\s*=\s*[^,]+,', entry):
+                  new_entry = re.sub(r'(\.extra2\s*=\s*)[^,]+,', r'\g<1>&kz_swap_max,', entry, count=1)
+              else:
+                  k = entry.index('.extra1')
+                  eol = entry.index('\n', k)
+                  new_entry = entry[:eol] + '\n\t\t.extra2\t\t= &kz_swap_max,' + entry[eol:]
+              s = s[:m.start()] + new_entry + s[end:]
+              t = s.index('static struct ctl_table vm_table[]')
+              s = s[:t] + 'static int kz_swap_max = %s; /* Kaelltzyy */\n' % sw + s[t:]
+              open(p, 'w').write(s)
+              print('ok    swappiness di-clamp max', sw)
+          else:
+              print('::warning::entry swappiness tidak ditemukan, clamp dilewati')
           PYEOF
 
       - name: Turbo schedutil (extra frequency headroom)
@@ -671,9 +896,12 @@ jobs:
                           r'\g<1>0; /* Kaelltzyy gaming */', s)
           n, c2 = re.subn(r'(net->ipv4\.sysctl_tcp_fastopen\s*=\s*)TFO_CLIENT_ENABLE;',
                           r'\g<1>TFO_CLIENT_ENABLE | TFO_SERVER_ENABLE; /* Kaelltzyy gaming */', n)
-          if c1 + c2:
+          n, c3 = re.subn(r'(net->ipv4\.sysctl_tcp_autocorking\s*=\s*)1;',
+                          r'\g<1>0; /* Kaelltzyy gaming */', n)
+          if c1 + c2 + c3:
               open(p, 'w').write(n)
-          print('slow_start_after_idle=0:', bool(c1), '| fastopen=3:', bool(c2))
+          print('slow_start_after_idle=0:', bool(c1), '| fastopen=3:', bool(c2),
+                '| autocorking=0:', bool(c3))
           if not c1:
               print('::warning::slow_start_after_idle tidak ditemukan, dilewati')
           if not c2:
@@ -737,8 +965,13 @@ jobs:
               -e CPU_FREQ_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
               -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
           fi
+          if grep -q '^config LRU_GEN' mm/Kconfig; then
+            scripts/config --file out/.config -e LRU_GEN -e LRU_GEN_ENABLED
+          else
+            echo "::warning::LRU_GEN (MGLRU) tidak ada di source ini, dilewati"
+          fi
           make $ARGS olddefconfig
-          grep -E "^CONFIG_(TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
+          grep -E "^CONFIG_(LRU_GEN|TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
           grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
