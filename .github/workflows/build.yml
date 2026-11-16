@@ -41,6 +41,22 @@ on:
         type: choice
         options: [latest, next, off]
         default: "latest"
+      gaming_tweaks:
+        description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      opt_o3:
+        description: "Compile -O3 (lebih kencang, build lebih lama, kecil kemungkinan gagal): on / off"
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      input_boost_ms:
+        description: "Durasi touch boost default (ms, kosongkan untuk skip)"
+        default: "200"
+      input_boost_pct:
+        description: "Touch boost: persen max freq (1-100, kosongkan untuk skip)"
+        default: "90"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -464,6 +480,31 @@ jobs:
           print('uname_release default =', rel)
           PYEOF
 
+      - name: Touch boost defaults (Yamada)
+        if: ${{ inputs.input_boost_ms != '' || inputs.input_boost_pct != '' }}
+        env:
+          MS: ${{ inputs.input_boost_ms }}
+          PCT: ${{ inputs.input_boost_pct }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          for key, env, lo, hi in (('input_boost_ms', 'MS', 1, 2000), ('input_boost_pct', 'PCT', 1, 100)):
+              v = os.environ.get(env, '').strip()
+              if not v:
+                  continue
+              n = max(lo, min(hi, int(v)))
+              old = 'static unsigned int %s = ' % key
+              i = s.index(old)
+              j = s.index(';', i)
+              s = s[:i] + old + str(n) + s[j:]
+              print(key, '=', n)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -nE "input_boost_(ms|pct) =" drivers/misc/kaelltzyy.c
+
       - name: Force ZRAM disksize
         if: ${{ inputs.zram_size_gb != '' && inputs.zram_size_gb != '0' }}
         env:
@@ -542,17 +583,86 @@ jobs:
           PYEOF
           grep -n "Kaelltzyy nodelay" net/ipv4/tcp.c
 
+      - name: Add Kaelltzyy cpufreq governor (copy of performance)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re, sys
+          src = 'drivers/cpufreq/cpufreq_performance.c'
+          s = open(src).read()
+          # buang blok default governor milik performance (supaya tidak dobel definisi)
+          s = re.sub(r'#ifdef\s+CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE.*?#endif\n?', '', s, flags=re.S)
+          s = s.replace('cpufreq_gov_performance', 'cpufreq_gov_kaelltzyy')
+          s = s.replace('"performance"', '"kaelltzyy"').replace("'performance'", "'kaelltzyy'")
+          assert 'cpufreq_default_governor' not in s, 'blok default governor masih ada'
+          assert '.name' in s and '"kaelltzyy"' in s
+
+          kc = 'drivers/cpufreq/Kconfig'
+          k = open(kc).read()
+          mk = 'drivers/cpufreq/Makefile'
+          m = open(mk).read()
+          anchor = 'config CPU_FREQ_GOV_POWERSAVE'
+          if anchor not in k:
+              print('::warning::Anchor Kconfig governor tidak ditemukan, governor Kaelltzyy dilewati')
+              sys.exit(0)
+          if 'CPU_FREQ_GOV_KAELLTZYY' not in k:
+              cfg = ('config CPU_FREQ_GOV_KAELLTZYY\n'
+                     '\tbool "\'kaelltzyy\' governor (performance clone)"\n'
+                     '\tdepends on CPU_FREQ\n'
+                     '\tdefault y\n'
+                     '\thelp\n'
+                     '\t  Kaelltzyy governor: statically pins CPU frequency to policy max.\n\n')
+              k = k.replace(anchor, cfg + anchor, 1)
+              open(kc, 'w').write(k)
+          if 'cpufreq_kaelltzyy' not in m:
+              open(mk, 'a').write('\nobj-$(CONFIG_CPU_FREQ_GOV_KAELLTZYY)\t+= cpufreq_kaelltzyy.o\n')
+          open('drivers/cpufreq/cpufreq_kaelltzyy.c', 'w').write(s)
+          print('governor kaelltzyy ditambahkan')
+          PYEOF
+          grep -n "kaelltzyy" drivers/cpufreq/cpufreq_kaelltzyy.c drivers/cpufreq/Makefile | head
+
       - name: Apply BORE patch
         if: ${{ inputs.bore_patch_url != '' }}
         run: |
           cd kernel
-          if curl -fL --retry 3 "${{ inputs.bore_patch_url }}" -o bore.patch \
-              && git apply --check bore.patch && git apply bore.patch; then
-            echo "CONFIG_SCHED_BORE=y" >> arch/arm64/configs/${{ inputs.defconfig }}
-            touch .applied_bore
-          else
-            echo "::warning::Patch BORE gagal dipasang (URL salah / tidak cocok), dilewati"
+          P="$GITHUB_WORKSPACE/bore.patch"
+          B="$GITHUB_WORKSPACE/bore_backup"
+          NF="$GITHUB_WORKSPACE/bore_newfiles"
+          rm -rf "$B" "$NF"; mkdir -p "$B"
+          if ! curl -fL --retry 3 "${{ inputs.bore_patch_url }}" -o "$P"; then
+            echo "::warning::Download patch BORE gagal, dilewati"; exit 0
           fi
+          if head -c 300 "$P" | grep -qiE '<html|<!doctype'; then
+            echo "::warning::URL BORE mengembalikan HTML (pakai link raw, bukan blob), dilewati"; exit 0
+          fi
+          # backup file yang disentuh patch, supaya bisa di-revert kalau build gagal
+          grep -E '^\+\+\+ ' "$P" | awk '{print $2}' | sed 's|^[ab]/||' | grep -v '^/dev/null$' | sort -u | \
+          while read -r f; do
+            if [ -f "$f" ]; then
+              mkdir -p "$B/$(dirname "$f")"; cp -p "$f" "$B/$f"
+            else
+              echo "$f" >> "$NF"
+            fi
+          done
+          ok=0
+          if git apply --check "$P" 2>/dev/null; then
+            git apply "$P" && ok=1
+          elif patch -p1 -F3 --no-backup-if-mismatch --dry-run < "$P" >/dev/null 2>&1; then
+            echo "git apply gagal, pakai patch -F3 (fuzz)"
+            patch -p1 -F3 --no-backup-if-mismatch < "$P" && ok=1
+          else
+            git apply --check "$P" 2>&1 | head -20 || true
+          fi
+          if [ "$ok" != 1 ]; then
+            echo "::warning::Patch BORE tidak cocok dengan source ini, dilewati"; exit 0
+          fi
+          if grep -rqE '^config SCHED_BORE' init/Kconfig kernel/Kconfig* kernel/sched 2>/dev/null; then
+            echo "CONFIG_SCHED_BORE=y" >> arch/arm64/configs/${{ inputs.defconfig }}
+          else
+            echo "::warning::Kconfig SCHED_BORE tidak ditemukan, patch dianggap selalu aktif"
+          fi
+          touch .applied_bore
+          echo "BORE terpasang"
 
       - name: Apply BBRv3 patch
         if: ${{ inputs.bbr3_patch_url != '' }}
@@ -587,6 +697,27 @@ jobs:
             echo "::warning::Patch touch boost gagal dipasang (URL salah / tidak cocok), dilewati"
           fi
 
+      - name: Gaming network defaults (anti-lag)
+        if: ${{ inputs.gaming_tweaks == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          p = 'net/ipv4/tcp_ipv4.c'
+          s = open(p).read()
+          n, c1 = re.subn(r'(net->ipv4\.sysctl_tcp_slow_start_after_idle\s*=\s*)1;',
+                          r'\g<1>0; /* Kaelltzyy gaming */', s)
+          n, c2 = re.subn(r'(net->ipv4\.sysctl_tcp_fastopen\s*=\s*)TFO_CLIENT_ENABLE;',
+                          r'\g<1>TFO_CLIENT_ENABLE | TFO_SERVER_ENABLE; /* Kaelltzyy gaming */', n)
+          if c1 + c2:
+              open(p, 'w').write(n)
+          print('slow_start_after_idle=0:', bool(c1), '| fastopen=3:', bool(c2))
+          if not c1:
+              print('::warning::slow_start_after_idle tidak ditemukan, dilewati')
+          if not c2:
+              print('::warning::tcp_fastopen default tidak ditemukan, dilewati')
+          PYEOF
+
       - name: Integrate KernelSU-Next
         if: ${{ inputs.kernelsu != 'off' }}
         run: |
@@ -605,7 +736,10 @@ jobs:
         run: |
           cd kernel
           export ARCH=arm64 KBUILD_BUILD_USER=kaelltzyy KBUILD_BUILD_HOST=github
-          ARGS="O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          export ARGS="O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          if [ "${{ inputs.opt_o3 }}" = "on" ]; then export ARGS="$ARGS KCFLAGS=-O3"; fi
+          cat > "$GITHUB_WORKSPACE/do_build.sh" <<'BEOF'
+          set -e
           make $ARGS ${{ inputs.defconfig }}
           LVN="-Kaelltzyy"
           if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-KSUN"; fi
@@ -635,6 +769,13 @@ jobs:
           if [ -f .applied_adios ]; then
             scripts/config --file out/.config -e MQ_IOSCHED_ADIOS
           fi
+          if [ "${{ inputs.gaming_tweaks }}" = "on" ]; then
+            scripts/config --file out/.config \
+              -d WQ_POWER_EFFICIENT_DEFAULT \
+              -e CPU_FREQ_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
+              -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
+          fi
+          scripts/config --file out/.config -e CPU_FREQ_GOV_PERFORMANCE -e CPU_FREQ_GOV_KAELLTZYY
           make $ARGS olddefconfig
           grep -E "^CONFIG_(TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
@@ -643,6 +784,24 @@ jobs:
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
           fi
           make $ARGS -j$(nproc) Image
+          BEOF
+          if ! bash "$GITHUB_WORKSPACE/do_build.sh"; then
+            if [ -f .applied_bore ]; then
+              echo "::warning::Build gagal dengan BORE, revert BORE lalu build ulang tanpa BORE"
+              if [ -d "$GITHUB_WORKSPACE/bore_backup" ]; then
+                cp -a "$GITHUB_WORKSPACE/bore_backup/." .
+              fi
+              if [ -f "$GITHUB_WORKSPACE/bore_newfiles" ]; then
+                while read -r f; do rm -f "$f"; done < "$GITHUB_WORKSPACE/bore_newfiles"
+              fi
+              sed -i '/^CONFIG_SCHED_BORE=y$/d' arch/arm64/configs/${{ inputs.defconfig }}
+              rm -f .applied_bore
+              rm -rf out
+              bash "$GITHUB_WORKSPACE/do_build.sh"
+            else
+              exit 1
+            fi
+          fi
 
       - name: Package AnyKernel3
         run: |
