@@ -583,44 +583,6 @@ jobs:
           PYEOF
           grep -n "Kaelltzyy nodelay" net/ipv4/tcp.c
 
-      - name: Add Kaelltzyy cpufreq governor (copy of performance)
-        run: |
-          cd kernel
-          python3 - <<'PYEOF'
-          import re, sys
-          src = 'drivers/cpufreq/cpufreq_performance.c'
-          s = open(src).read()
-          # buang blok default governor milik performance (supaya tidak dobel definisi)
-          s = re.sub(r'#ifdef\s+CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE.*?#endif\n?', '', s, flags=re.S)
-          s = s.replace('cpufreq_gov_performance', 'cpufreq_gov_kaelltzyy')
-          s = s.replace('"performance"', '"kaelltzyy"').replace("'performance'", "'kaelltzyy'")
-          assert 'cpufreq_default_governor' not in s, 'blok default governor masih ada'
-          assert '.name' in s and '"kaelltzyy"' in s
-
-          kc = 'drivers/cpufreq/Kconfig'
-          k = open(kc).read()
-          mk = 'drivers/cpufreq/Makefile'
-          m = open(mk).read()
-          anchor = 'config CPU_FREQ_GOV_POWERSAVE'
-          if anchor not in k:
-              print('::warning::Anchor Kconfig governor tidak ditemukan, governor Kaelltzyy dilewati')
-              sys.exit(0)
-          if 'CPU_FREQ_GOV_KAELLTZYY' not in k:
-              cfg = ('config CPU_FREQ_GOV_KAELLTZYY\n'
-                     '\tbool "\'kaelltzyy\' governor (performance clone)"\n'
-                     '\tdepends on CPU_FREQ\n'
-                     '\tdefault y\n'
-                     '\thelp\n'
-                     '\t  Kaelltzyy governor: statically pins CPU frequency to policy max.\n\n')
-              k = k.replace(anchor, cfg + anchor, 1)
-              open(kc, 'w').write(k)
-          if 'cpufreq_kaelltzyy' not in m:
-              open(mk, 'a').write('\nobj-$(CONFIG_CPU_FREQ_GOV_KAELLTZYY)\t+= cpufreq_kaelltzyy.o\n')
-          open('drivers/cpufreq/cpufreq_kaelltzyy.c', 'w').write(s)
-          print('governor kaelltzyy ditambahkan')
-          PYEOF
-          grep -n "kaelltzyy" drivers/cpufreq/cpufreq_kaelltzyy.c drivers/cpufreq/Makefile | head
-
       - name: Apply BORE patch
         if: ${{ inputs.bore_patch_url != '' }}
         run: |
@@ -775,7 +737,6 @@ jobs:
               -e CPU_FREQ_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
               -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
           fi
-          scripts/config --file out/.config -e CPU_FREQ_GOV_PERFORMANCE -e CPU_FREQ_GOV_KAELLTZYY
           make $ARGS olddefconfig
           grep -E "^CONFIG_(TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
