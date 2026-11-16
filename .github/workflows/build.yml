@@ -546,34 +546,46 @@ jobs:
         if: ${{ inputs.bore_patch_url != '' }}
         run: |
           cd kernel
-          curl -fL "${{ inputs.bore_patch_url }}" -o bore.patch
-          git apply --check bore.patch
-          git apply bore.patch
-          echo "CONFIG_SCHED_BORE=y" >> arch/arm64/configs/${{ inputs.defconfig }}
+          if curl -fL --retry 3 "${{ inputs.bore_patch_url }}" -o bore.patch \
+              && git apply --check bore.patch && git apply bore.patch; then
+            echo "CONFIG_SCHED_BORE=y" >> arch/arm64/configs/${{ inputs.defconfig }}
+            touch .applied_bore
+          else
+            echo "::warning::Patch BORE gagal dipasang (URL salah / tidak cocok), dilewati"
+          fi
 
       - name: Apply BBRv3 patch
         if: ${{ inputs.bbr3_patch_url != '' }}
         run: |
           cd kernel
-          curl -fL "${{ inputs.bbr3_patch_url }}" -o bbr3.patch
-          git apply --check bbr3.patch
-          git apply bbr3.patch
+          if curl -fL --retry 3 "${{ inputs.bbr3_patch_url }}" -o bbr3.patch \
+              && git apply --check bbr3.patch && git apply bbr3.patch; then
+            touch .applied_bbr3
+          else
+            echo "::warning::Patch BBRv3 gagal dipasang (URL salah / tidak cocok), dilewati"
+          fi
 
       - name: Apply ADIOS patch
         if: ${{ inputs.adios_patch_url != '' }}
         run: |
           cd kernel
-          curl -fL "${{ inputs.adios_patch_url }}" -o adios.patch
-          git apply --check adios.patch
-          git apply adios.patch
+          if curl -fL --retry 3 "${{ inputs.adios_patch_url }}" -o adios.patch \
+              && git apply --check adios.patch && git apply adios.patch; then
+            touch .applied_adios
+          else
+            echo "::warning::Patch ADIOS gagal dipasang (URL salah / tidak cocok), dilewati"
+          fi
 
       - name: Apply touch boost patch
         if: ${{ inputs.touch_boost_patch_url != '' }}
         run: |
           cd kernel
-          curl -fL "${{ inputs.touch_boost_patch_url }}" -o touch_boost.patch
-          git apply --check touch_boost.patch
-          git apply touch_boost.patch
+          if curl -fL --retry 3 "${{ inputs.touch_boost_patch_url }}" -o touch_boost.patch \
+              && git apply --check touch_boost.patch && git apply touch_boost.patch; then
+            echo "touch boost terpasang"
+          else
+            echo "::warning::Patch touch boost gagal dipasang (URL salah / tidak cocok), dilewati"
+          fi
 
       - name: Integrate KernelSU-Next
         if: ${{ inputs.kernelsu != 'off' }}
@@ -614,13 +626,13 @@ jobs:
             -d ZRAM_DEF_COMP_LZORLE -d ZRAM_DEF_COMP_LZO -e ZRAM_DEF_COMP_LZ4
           scripts/config --file out/.config -e NET_SCH_FQ -e NET_SCH_DEFAULT \
             -d DEFAULT_PFIFO_FAST -d DEFAULT_FQ_CODEL -e DEFAULT_FQ --set-str DEFAULT_NET_SCH fq
-          if [ -z "${{ inputs.bbr3_patch_url }}" ]; then
-            echo "::warning::bbr3_patch_url kosong: 'bbr' di build ini masih BBRv1"
+          if [ ! -f .applied_bbr3 ]; then
+            echo "::warning::BBRv3 tidak terpasang: 'bbr' di build ini masih BBRv1"
           fi
-          if [ -n "${{ inputs.bbr3_patch_url }}" ]; then
+          if [ -f .applied_bbr3 ]; then
             scripts/config --file out/.config -e TCP_CONG_BBR --set-str DEFAULT_TCP_CONG bbr
           fi
-          if [ -n "${{ inputs.adios_patch_url }}" ]; then
+          if [ -f .applied_adios ]; then
             scripts/config --file out/.config -e MQ_IOSCHED_ADIOS
           fi
           make $ARGS olddefconfig
