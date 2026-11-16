@@ -36,6 +36,16 @@ on:
       bore_patch_url:
         description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
         default: ""
+      kernelsu:
+        description: "KernelSU: latest (tag stabil terbaru) / main (dev) / off"
+        type: choice
+        options: [latest, main, off]
+        default: "latest"
+      lto_mode:
+        description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
+        type: choice
+        options: [thin, none]
+        default: "thin"
 
 jobs:
   build:
@@ -43,8 +53,19 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL
           df -h
+
+      - name: Add swap (cegah OOM saat link LTO)
+        run: |
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
 
       - name: Install deps
         run: |
@@ -544,12 +565,36 @@ jobs:
           git apply --check touch_boost.patch
           git apply touch_boost.patch
 
+      - name: Integrate KernelSU
+        if: ${{ inputs.kernelsu != 'off' }}
+        run: |
+          cd kernel
+          URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+          if [ "${{ inputs.kernelsu }}" = "main" ]; then
+            curl -LSs "$URL" | bash -s main
+          else
+            curl -LSs "$URL" | bash -
+          fi
+          ls -la drivers | grep -i kernelsu
+          git -C KernelSU log -1 --oneline
+          git -C KernelSU describe --tags --always
+
       - name: Build
         run: |
           cd kernel
           export ARCH=arm64 KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=github
           ARGS="O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $ARGS ${{ inputs.defconfig }}
+          if [ "${{ inputs.lto_mode }}" = "none" ]; then
+            scripts/config --file out/.config \
+              -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE -d CFI_CLANG
+          else
+            scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN
+          fi
+          if [ "${{ inputs.kernelsu }}" != "off" ]; then
+            scripts/config --file out/.config \
+              -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+          fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
           scripts/config --file out/.config -e ZRAM -e CRYPTO_LZ4 \
@@ -568,6 +613,10 @@ jobs:
           make $ARGS olddefconfig
           grep -E "^CONFIG_(TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
+          grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES)" out/.config || true
+          if [ "${{ inputs.kernelsu }}" != "off" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
+          fi
           make $ARGS -j$(nproc) Image
 
       - name: Package AnyKernel3
