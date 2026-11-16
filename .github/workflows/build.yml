@@ -489,7 +489,7 @@ jobs:
               strong) extra='freq += freq >> 1;' ;;
               *)      extra='freq += freq >> 2;' ;;
             esac
-            sed -i "s|freq = map_util_freq(util, freq, max);|freq = map_util_freq(util, freq, max); ${extra} /* Kaelltzyy turbo */|" "$f"
+            sed -i "s|freq = map_util_freq(util, freq, max);|{ freq = map_util_freq(util, freq, max); ${extra} /* Kaelltzyy turbo */ }|" "$f"
             grep -n "Kaelltzyy turbo" "$f"
           else
             echo "::warning::Baris map_util_freq tidak ditemukan, turbo dilewati"
@@ -555,7 +555,7 @@ jobs:
           scripts/config --file out/.config -e ZRAM -e CRYPTO_LZ4 \
             -d ZRAM_DEF_COMP_LZORLE -d ZRAM_DEF_COMP_LZO -e ZRAM_DEF_COMP_LZ4
           scripts/config --file out/.config -e NET_SCH_FQ -e NET_SCH_DEFAULT \
-            -d DEFAULT_PFIFO_FAST -e DEFAULT_FQ --set-str DEFAULT_NET_SCH fq
+            -d DEFAULT_PFIFO_FAST -d DEFAULT_FQ_CODEL -e DEFAULT_FQ --set-str DEFAULT_NET_SCH fq
           if [ -z "${{ inputs.bbr3_patch_url }}" ]; then
             echo "::warning::bbr3_patch_url kosong: 'bbr' di build ini masih BBRv1"
           fi
