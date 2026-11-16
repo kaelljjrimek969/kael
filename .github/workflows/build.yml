@@ -37,9 +37,9 @@ on:
         description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
         default: ""
       kernelsu:
-        description: "KernelSU: latest (tag stabil terbaru) / main (dev) / off"
+        description: "KernelSU-Next: latest (tag stabil terbaru) / next (branch dev) / off"
         type: choice
-        options: [latest, main, off]
+        options: [latest, next, off]
         default: "latest"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
@@ -82,8 +82,18 @@ jobs:
 
       - name: Clone kernel
         run: |
-          git clone --depth=1 -b ${{ inputs.branch }} \
-            https://github.com/${{ inputs.repo }} kernel
+          git config --global http.postBuffer 524288000
+          git config --global http.version HTTP/1.1
+          for i in 1 2 3 4 5; do
+            rm -rf kernel
+            if git clone --depth=1 --single-branch -b ${{ inputs.branch }} \
+                https://github.com/${{ inputs.repo }} kernel; then
+              break
+            fi
+            echo "::warning::clone gagal (percobaan $i/5), coba lagi..."
+            [ "$i" = 5 ] && { echo "::error::clone gagal 5x"; exit 1; }
+            sleep $((i * 15))
+          done
 
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof)
         run: |
@@ -565,26 +575,29 @@ jobs:
           git apply --check touch_boost.patch
           git apply touch_boost.patch
 
-      - name: Integrate KernelSU
+      - name: Integrate KernelSU-Next
         if: ${{ inputs.kernelsu != 'off' }}
         run: |
           cd kernel
-          URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
-          if [ "${{ inputs.kernelsu }}" = "main" ]; then
-            curl -LSs "$URL" | bash -s main
+          URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+          if [ "${{ inputs.kernelsu }}" = "next" ]; then
+            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s next
           else
-            curl -LSs "$URL" | bash -
+            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -
           fi
           ls -la drivers | grep -i kernelsu
-          git -C KernelSU log -1 --oneline
-          git -C KernelSU describe --tags --always
+          git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next describe --tags --always
 
       - name: Build
         run: |
           cd kernel
-          export ARCH=arm64 KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=github
+          export ARCH=arm64 KBUILD_BUILD_USER=kaelltzyy KBUILD_BUILD_HOST=github
           ARGS="O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $ARGS ${{ inputs.defconfig }}
+          LVN="-Kaelltzyy"
+          if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-KSUN"; fi
+          scripts/config --file out/.config --set-str LOCALVERSION "$LVN" -d LOCALVERSION_AUTO
           if [ "${{ inputs.lto_mode }}" = "none" ]; then
             scripts/config --file out/.config \
               -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE -d CFI_CLANG
@@ -613,7 +626,7 @@ jobs:
           make $ARGS olddefconfig
           grep -E "^CONFIG_(TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
-          grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES)" out/.config || true
+          grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
           fi
@@ -623,6 +636,35 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cp kernel/out/arch/arm64/boot/Image ak3/
+          cat > ak3/anykernel.sh <<'AKEOF'
+          ### AnyKernel3 - Kaelltzyy GKI 5.10 (tanpa cek device, kernel saja)
+          properties() { '
+          kernel.string=Kaelltzyy KSUN GKI 5.10
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          AKEOF
           cd ak3 && zip -r9 ../Kaelltzyy-GKI-5.10.zip . -x ".git*"
 
       - uses: actions/upload-artifact@v4
