@@ -41,6 +41,17 @@ on:
         type: choice
         options: [latest, next, off]
         default: "latest"
+      susfs:
+        description: "SUSFS (hide root/mount/path). Butuh kernelsu != off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      ksu_susfs_branch:
+        description: "Branch KernelSU-Next yang sudah ada integrasi SUSFS (dipakai kalau susfs=on)"
+        default: "next-susfs"
+      susfs_kernel_branch:
+        description: "Branch susfs4ksu untuk patch sisi kernel (dipakai kalau source belum punya fs/susfs.c)"
+        default: "gki-android12-5.10"
       gaming_tweaks:
         description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
         type: choice
@@ -1140,7 +1151,10 @@ jobs:
         run: |
           cd kernel
           URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
-          if [ "${{ inputs.kernelsu }}" = "next" ]; then
+          if [ "${{ inputs.susfs }}" = "on" ]; then
+            # Branch polos 'next'/tag stabil TIDAK punya hook SUSFS -> wajib branch susfs
+            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s "${{ inputs.ksu_susfs_branch }}"
+          elif [ "${{ inputs.kernelsu }}" = "next" ]; then
             curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s next
           else
             curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -
@@ -1148,6 +1162,36 @@ jobs:
           ls -la drivers | grep -i kernelsu
           git -C KernelSU-Next log -1 --oneline
           git -C KernelSU-Next describe --tags --always
+          if [ "${{ inputs.susfs }}" = "on" ]; then
+            if ! grep -rqi "susfs" KernelSU-Next/kernel; then
+              echo "::error::Branch KernelSU-Next '${{ inputs.ksu_susfs_branch }}' tidak mengandung kode SUSFS. Cek nama branch di repo KernelSU-Next."
+              exit 1
+            fi
+            echo "KSU-Next sisi SUSFS: OK"
+          fi
+
+      - name: Integrate SUSFS (kernel side)
+        if: ${{ inputs.kernelsu != 'off' && inputs.susfs == 'on' }}
+        run: |
+          cd kernel
+          if [ -f fs/susfs.c ] && [ -f include/linux/susfs.h ]; then
+            echo "Source sudah punya SUSFS, skip patch kernel"
+          else
+            git clone --depth=1 -b "${{ inputs.susfs_kernel_branch }}" \
+              https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu"
+            KP="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
+            cp -v "$KP"/fs/* fs/
+            cp -v "$KP"/include/linux/* include/linux/
+            PATCH=$(ls "$KP"/50_add_susfs_in_gki-*.patch | head -1)
+            echo "Patch: $PATCH"
+            if ! patch -p1 --dry-run < "$PATCH"; then
+              echo "::error::Patch SUSFS kernel-side tidak cocok dengan source ini (hunk gagal). Perlu rebase manual."
+              exit 1
+            fi
+            patch -p1 < "$PATCH"
+          fi
+          grep -rn "SUSFS_VERSION" include/linux/susfs*.h | head -3 || true
+          [ -f fs/susfs.c ] || { echo "::error::fs/susfs.c tidak ada"; exit 1; }
 
       - name: Build
         run: |
@@ -1160,6 +1204,7 @@ jobs:
           make $ARGS ${{ inputs.defconfig }}
           LVN="-Kaelltzyy"
           if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-KSUN"; fi
+          if [ "${{ inputs.kernelsu }}" != "off" ] && [ "${{ inputs.susfs }}" = "on" ]; then LVN="${LVN}-SUSFS"; fi
           scripts/config --file out/.config --set-str LOCALVERSION "$LVN" -d LOCALVERSION_AUTO
           if [ "${{ inputs.lto_mode }}" = "none" ]; then
             scripts/config --file out/.config \
@@ -1170,6 +1215,17 @@ jobs:
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             scripts/config --file out/.config \
               -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+          fi
+          if [ "${{ inputs.kernelsu }}" != "off" ] && [ "${{ inputs.susfs }}" = "on" ]; then
+            # Simbol yang tidak ada di versi SUSFS ini akan dibuang diam-diam oleh olddefconfig (aman)
+            for sym in KSU_SUSFS KSU_SUSFS_HAS_MAGIC_MOUNT KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
+                       KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+                       KSU_SUSFS_SUS_KSTAT KSU_SUSFS_TRY_UMOUNT KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                       KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+              scripts/config --file out/.config -e "$sym"
+            done
+            # SPOOF_UNAME sengaja off: bentrok dengan uname spoof driver kaelltzyy
+            scripts/config --file out/.config -d KSU_SUSFS_SPOOF_UNAME -d KSU_SUSFS_ENABLE_LOG
           fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
@@ -1211,6 +1267,15 @@ jobs:
           grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
+          fi
+          if [ "${{ inputs.kernelsu }}" != "off" ] && [ "${{ inputs.susfs }}" = "on" ]; then
+            echo "=== SUSFS config akhir ==="
+            grep -E "^CONFIG_KSU_SUSFS" out/.config || true
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config || {
+              echo "::error::CONFIG_KSU_SUSFS tidak aktif di .config akhir (simbol Kconfig tidak ada / depend tidak terpenuhi)"
+              grep -rn "config KSU_SUSFS" drivers/kernelsu/ KernelSU-Next/kernel/Kconfig fs/Kconfig 2>/dev/null | head || true
+              exit 1
+            }
           fi
           make $ARGS -j$(nproc) Image
           BEOF
