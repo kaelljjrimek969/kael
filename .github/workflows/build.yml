@@ -35,7 +35,7 @@ on:
         default: ""
       bore_patch_url:
         description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
-        default: ""
+        default: "https://github.com/riza220201/itel-rs4-kernel/raw/refs/heads/main/patches/bore-5.10-kmi.patch"
       kernelsu:
         description: "KernelSU-Next: latest (tag stabil terbaru) / next (branch dev) / off"
         type: choice
@@ -1132,6 +1132,13 @@ jobs:
           make $ARGS olddefconfig
           grep -E "^CONFIG_(LRU_GEN|TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
+          if grep -q '^CONFIG_LRU_GEN=y' out/.config; then
+            echo "MGLRU AKTIF: $(grep -E '^CONFIG_LRU_GEN(_ENABLED)?=' out/.config | tr '\n' ' ')"
+          else
+            echo "::warning::MGLRU TIDAK aktif di .config akhir"
+            grep -n -A14 '^config LRU_GEN' mm/Kconfig \
+              || echo "mm/Kconfig tidak punya LRU_GEN: source ini belum ada MGLRU (perlu backport)"
+          fi
           grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
