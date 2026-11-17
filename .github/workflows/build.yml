@@ -46,7 +46,7 @@ on:
         default: "finasu"
       finasu_ref:
         description: "Branch/tag FinaSU (kosongkan = default branch)"
-        default: "release/v1.6.0"
+        default: "release/v1.4.3"
       susfs:
         description: "SUSFS inline hook (butuh finasu): on / off"
         type: choice
@@ -54,7 +54,7 @@ on:
         default: "on"
       susfs_ref:
         description: "Commit/tag susfs4ksu (branch gki-android12-5.10)"
-        default: "5436438"
+        default: "b0e4746"
       gaming_tweaks:
         description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
         type: choice
@@ -186,7 +186,7 @@ jobs:
           PF="$S/50_add_susfs_in_gki-android12-5.10.patch"
           if ! patch -p1 -F3 --dry-run < "$PF" >/dev/null 2>&1; then
             echo "::error::Patch SUSFS tidak cocok dengan source ini (kemungkinan karena upgrade ke 5.10.274 atau perbedaan tree). Dry-run:"
-            patch -p1 -F3 --dry-run < "$PF" | grep -E 'FAILED|rej|Hunk' | head -30 || true
+            patch -p1 -F3 --dry-run < "$PF" | head -80 || true
             exit 1
           fi
           patch -p1 -F3 --no-backup-if-mismatch < "$PF"
