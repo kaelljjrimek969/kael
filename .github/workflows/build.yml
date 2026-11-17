@@ -12,9 +12,6 @@ on:
       defconfig:
         description: "Defconfig"
         default: "gki_defconfig"
-      target_version:
-        description: "Naikkan source ke versi stable upstream ini (mis. 5.10.274, kosongkan untuk skip)"
-        default: "5.10.274"
       schedutil_rate_limit_us:
         description: "Default schedutil rate_limit_us (kosongkan untuk skip)"
         default: "500"
@@ -69,11 +66,6 @@ on:
       spoof_temp_c:
         description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
         default: "15"
-      disable_debug:
-        description: "Matikan debug overhead kernel (DEBUG_INFO, lockdep, KASAN, dll): on / off"
-        type: choice
-        options: ["on", "off"]
-        default: "on"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -127,63 +119,6 @@ jobs:
             [ "$i" = 5 ] && { echo "::error::clone gagal 5x"; exit 1; }
             sleep $((i * 15))
           done
-
-      - name: Upgrade ke stable upstream
-        if: ${{ inputs.target_version != '' }}
-        env:
-          TARGET: ${{ inputs.target_version }}
-        run: |
-          cd kernel
-          echo "$TARGET" | grep -qE '^5\.10\.[0-9]+$' || { echo "::error::target_version harus 5.10.N"; exit 1; }
-          cur=$(sed -n 's/^SUBLEVEL = //p' Makefile | head -1)
-          tgt=${TARGET#5.10.}
-          echo "Source sekarang: 5.10.$cur -> target: 5.10.$tgt"
-          if [ "$cur" -ge "$tgt" ]; then
-            echo "Sudah di 5.10.$cur, upgrade dilewati"; exit 0
-          fi
-          mkdir -p "$GITHUB_WORKSPACE/incr"
-          for n in $(seq $((cur+1)) "$tgt"); do
-            u="https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.$((n-1))-$n.xz"
-            curl -fL --retry 3 "$u" -o "$GITHUB_WORKSPACE/incr/$n.xz" \
-              || { echo "::warning::patch incremental $((n-1))->$n tidak ada, upgrade dibatalkan"; exit 0; }
-          done
-          for n in $(seq $((cur+1)) "$tgt"); do
-            xz -dc "$GITHUB_WORKSPACE/incr/$n.xz" | \
-              patch -p1 -N -F3 --no-backup-if-mismatch -s || true
-          done
-          rej=$(find . -name '*.rej' | wc -l)
-          if [ "$rej" -gt 0 ]; then
-            echo "::warning::$rej hunk ditolak (umumnya sudah ada di ACK/vendor tree). Daftar:"
-            find . -name '*.rej'
-            for r in $(find . -name '*.rej' | sort); do
-              echo "::group::REJECT $r"
-              cat "$r"
-              echo "::endgroup::"
-            done
-            find . -name '*.rej' -delete
-          fi
-          find . -name '*.orig' -delete
-          sed -n '1,5p' Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
-
-      - name: Fix duplikat f2fs_gc_kthread (efek upgrade stable)
-        if: ${{ inputs.target_version != '' }}
-        run: |
-          cd kernel
-          python3 - <<'PYEOF'
-          import re
-          f, g = 'fs/f2fs/f2fs.h', 'fs/f2fs/gc.h'
-          pat = re.compile(r'struct f2fs_gc_kthread \{.*?\n\};\n', re.S)
-          try:
-              fs, gs = open(f).read(), open(g).read()
-          except FileNotFoundError:
-              print('f2fs tidak ada, skip'); raise SystemExit
-          if pat.search(fs) and pat.search(gs):
-              open(g, 'w').write(pat.sub('', gs, count=1))
-              print('ok    struct f2fs_gc_kthread duplikat dihapus dari gc.h')
-          else:
-              print('tidak ada duplikat f2fs_gc_kthread')
-          PYEOF
-          grep -n "struct f2fs_gc_kthread {" fs/f2fs/*.h
 
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
@@ -259,6 +194,7 @@ jobs:
               struct freq_qos_request boot_req;
               struct freq_qos_request input_req;
               struct freq_qos_request floor_req;
+              struct freq_qos_request game_req;
               bool floor_on;
               unsigned int max_freq;
               bool init;
@@ -275,6 +211,16 @@ jobs:
           static struct delayed_work affinity_work;
           static struct cpumask kz_big_mask;
           static bool kz_have_big;
+
+          static unsigned int game_min_pct = 100;
+          module_param(game_min_pct, uint, 0644);
+          static bool game_mode;
+
+          static unsigned int kz_game_floor(unsigned int max_freq)
+          {
+              return max_freq / 100 * min_t(unsigned int, game_min_pct, 100);
+          }
+
 
           /* dipanggil dari drivers/thermal/thermal_sysfs.c (temp_show), satuan mC */
           int kaelltzyy_zone_temp(int real)
@@ -315,12 +261,21 @@ jobs:
                           freq_qos_remove_request(&kz[first].boot_req);
                           goto next;
                       }
-                      if (min_floor_pct)
-                          kz[first].floor_on = freq_qos_add_request(&p->constraints,
-                                  &kz[first].floor_req, FREQ_QOS_MIN,
-                                  p->cpuinfo.max_freq / 100 *
-                                  min_t(unsigned int, min_floor_pct, 100)) >= 0;
-                      kz[first].init = true;
+                              if (freq_qos_add_request(&p->constraints, &kz[first].game_req,
+                                      FREQ_QOS_MIN,
+                                      game_mode ? kz_game_floor(kz[first].max_freq) :
+                                                  FREQ_QOS_MIN_DEFAULT_VALUE) < 0) {
+                                  freq_qos_remove_request(&kz[first].boot_req);
+                                  freq_qos_remove_request(&kz[first].input_req);
+                                  goto next;
+                              }
+
+                                if (min_floor_pct)
+                                    kz[first].floor_on = freq_qos_add_request(&p->constraints,
+                                            &kz[first].floor_req, FREQ_QOS_MIN,
+                                            p->cpuinfo.max_freq / 100 *
+                                            min_t(unsigned int, min_floor_pct, 100)) >= 0;
+                                kz[first].init = true;
                       pr_info("policy%u attached (max %u kHz)\n", first, kz[first].max_freq);
                   }
           next:
@@ -500,7 +455,10 @@ jobs:
                   if (!name)
                       continue;
                   if (strstr(name, "touch") || strstr(name, "tpd") ||
-                      strstr(name, "mali") || strstr(name, "gpu"))
+                      strstr(name, "mali") || strstr(name, "gpu") ||
+                      strstr(name, "kgsl") || strstr(name, "adreno") ||
+                      strstr(name, "goodix") || strstr(name, "fts") ||
+                      strstr(name, "nvt") || strstr(name, "synaptics"))
                       irq_set_affinity(irq, &kz_big_mask);
               }
               pr_info("kswapd/irq affinity applied\n");
@@ -581,6 +539,51 @@ jobs:
                   time_before(jiffies, gpu_deadline))
                   schedule_delayed_work(&gpu_work, 5 * HZ);
           }
+
+          /* GPU: lock min_freq ke max saat game mode, balik ke floor/0 saat off */
+          static void kz_gpu_lock(bool on)
+          {
+              unsigned long maxf, target = 0;
+              char buf[24];
+
+              if (kz_read_ulong(KZ_GPU_DEVFREQ "/max_freq", &maxf) || !maxf)
+                  return;
+              if (on)
+                  target = maxf;
+              else if (gpu_floor_pct)
+                  target = maxf / 100 * min_t(unsigned int, gpu_floor_pct, 100);
+              snprintf(buf, sizeof(buf), "%lu", target);
+              kz_write_file(KZ_GPU_DEVFREQ "/min_freq", buf);
+          }
+
+          /* echo 1 > /sys/module/kaelltzyy/parameters/game_mode  (0 untuk mati) */
+          static int kz_game_set(const char *val, const struct kernel_param *kp)
+          {
+              bool on;
+              int i, ret;
+
+              ret = kstrtobool(val, &on);
+              if (ret)
+                  return ret;
+              mutex_lock(&kz_lock);
+              game_mode = on;
+              for (i = 0; i < NR_CPUS; i++)
+                  if (kz[i].init)
+                      freq_qos_update_request(&kz[i].game_req,
+                          on ? kz_game_floor(kz[i].max_freq) : FREQ_QOS_MIN_DEFAULT_VALUE);
+              mutex_unlock(&kz_lock);
+              kz_gpu_lock(on);
+              if (on)
+                  mod_delayed_work(system_wq, &affinity_work, 0);
+              pr_info("game mode %s\n", on ? "ON" : "OFF");
+              return 0;
+          }
+
+          static const struct kernel_param_ops kz_game_ops = {
+              .set = kz_game_set,
+              .get = param_get_bool,
+          };
+          module_param_cb(game_mode, &kz_game_ops, &game_mode, 0644);
 
           static int __init kz_init(void)
           {
@@ -1168,27 +1171,6 @@ jobs:
             scripts/config --file out/.config \
               -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
           fi
-          if [ "${{ inputs.disable_debug }}" = "on" ]; then
-            # DEBUG_INFO_BTF butuh DEBUG_INFO: kalau BTF aktif, DEBUG_INFO dibiarkan
-            if grep -q '^CONFIG_DEBUG_INFO_BTF=y' out/.config; then
-              echo "::warning::DEBUG_INFO_BTF aktif di defconfig, DEBUG_INFO dibiarkan (BTF butuh itu)"
-            else
-              scripts/config --file out/.config \
-                -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_DWARF5 \
-                -d DEBUG_INFO_REDUCED -d DEBUG_INFO_SPLIT -e DEBUG_INFO_NONE
-            fi
-            scripts/config --file out/.config \
-              -d KASAN -d UBSAN -d KCSAN -d KFENCE -d DEBUG_KMEMLEAK \
-              -d PROVE_LOCKING -d LOCKDEP -d DEBUG_LOCK_ALLOC -d LOCK_STAT \
-              -d DEBUG_SPINLOCK -d DEBUG_MUTEXES -d DEBUG_RT_MUTEXES \
-              -d DEBUG_WW_MUTEX_SLOWPATH -d DEBUG_ATOMIC_SLEEP -d DEBUG_PREEMPT \
-              -d DEBUG_LIST -d DEBUG_SG -d DEBUG_NOTIFIERS -d DEBUG_CREDENTIALS \
-              -d DEBUG_OBJECTS -d DEBUG_VM -d DEBUG_PAGEALLOC -d DEBUG_STACK_USAGE \
-              -d PAGE_OWNER -d PAGE_POISONING -d SLUB_DEBUG_ON -d SCHEDSTATS \
-              -d LATENCYTOP -d PM_DEBUG -d PM_ADVANCED_DEBUG -d DEBUG_SHIRQ \
-              -d WQ_WATCHDOG -d SOFTLOCKUP_DETECTOR -d HARDLOCKUP_DETECTOR \
-              -d PANIC_ON_OOPS -d BUG_ON_DATA_CORRUPTION -d DEBUG_PI_LIST
-          fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
           scripts/config --file out/.config -e ZRAM -e CRYPTO_LZ4 \
@@ -1208,7 +1190,8 @@ jobs:
             scripts/config --file out/.config \
               -d WQ_POWER_EFFICIENT_DEFAULT \
               -e CPU_FREQ_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
-              -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
+              -e UCLAMP_TASK -e UCLAMP_TASK_GROUP \
+              -e RCU_EXPERT -e RCU_EXPEDITE_BOOT
           fi
           if grep -q '^config LRU_GEN' mm/Kconfig; then
             scripts/config --file out/.config -e LRU_GEN -e LRU_GEN_ENABLED
@@ -1218,7 +1201,6 @@ jobs:
           make $ARGS olddefconfig
           grep -E "^CONFIG_(LRU_GEN|TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
-          grep -cE "^CONFIG_(DEBUG_INFO|KASAN|LOCKDEP|PROVE_LOCKING|DEBUG_SPINLOCK|DEBUG_MUTEXES)=y" out/.config || true
           if grep -q '^CONFIG_LRU_GEN=y' out/.config; then
             echo "MGLRU AKTIF: $(grep -E '^CONFIG_LRU_GEN(_ENABLED)?=' out/.config | tr '\n' ' ')"
           else
@@ -1232,23 +1214,28 @@ jobs:
           fi
           make $ARGS -j$(nproc) Image
           BEOF
-          if ! bash "$GITHUB_WORKSPACE/do_build.sh"; then
-            if [ -f .applied_bore ]; then
-              echo "::warning::Build gagal dengan BORE, revert BORE lalu build ulang tanpa BORE"
-              if [ -d "$GITHUB_WORKSPACE/bore_backup" ]; then
-                cp -a "$GITHUB_WORKSPACE/bore_backup/." .
-              fi
-              if [ -f "$GITHUB_WORKSPACE/bore_newfiles" ]; then
-                while read -r f; do rm -f "$f"; done < "$GITHUB_WORKSPACE/bore_newfiles"
-              fi
-              sed -i '/^CONFIG_SCHED_BORE=y$/d' arch/arm64/configs/${{ inputs.defconfig }}
-              rm -f .applied_bore
-              rm -rf out
-              bash "$GITHUB_WORKSPACE/do_build.sh"
-            else
-              exit 1
+          build_ok=0
+          bash "$GITHUB_WORKSPACE/do_build.sh" && build_ok=1
+          if [ "$build_ok" != 1 ] && [ -f .applied_bore ]; then
+            echo "::warning::Build gagal dengan BORE, revert BORE lalu build ulang tanpa BORE"
+            if [ -d "$GITHUB_WORKSPACE/bore_backup" ]; then
+              cp -a "$GITHUB_WORKSPACE/bore_backup/." .
             fi
+            if [ -f "$GITHUB_WORKSPACE/bore_newfiles" ]; then
+              while read -r f; do rm -f "$f"; done < "$GITHUB_WORKSPACE/bore_newfiles"
+            fi
+            sed -i '/^CONFIG_SCHED_BORE=y$/d' arch/arm64/configs/${{ inputs.defconfig }}
+            rm -f .applied_bore
+            rm -rf out
+            bash "$GITHUB_WORKSPACE/do_build.sh" && build_ok=1
           fi
+          if [ "$build_ok" != 1 ] && [ "${{ inputs.opt_o3 }}" = "on" ]; then
+            echo "::warning::Build gagal dengan -O3, build ulang dengan -O2"
+            export ARGS="${ARGS/ KCFLAGS=-O3/}"
+            rm -rf out
+            bash "$GITHUB_WORKSPACE/do_build.sh" && build_ok=1
+          fi
+          [ "$build_ok" = 1 ] || { echo "::error::Build gagal"; exit 1; }
 
       - name: Package AnyKernel3
         run: |
@@ -1288,7 +1275,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Kaelltzyy-GKI-5.10
-          if-no-files-found: error
           path: |
             Kaelltzyy-GKI-5.10.zip
             kernel/out/arch/arm64/boot/Image
