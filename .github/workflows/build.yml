@@ -12,6 +12,9 @@ on:
       defconfig:
         description: "Defconfig"
         default: "gki_defconfig"
+      target_version:
+        description: "Naikkan source ke versi stable upstream ini (mis. 5.10.274, kosongkan untuk skip)"
+        default: "5.10.274"
       schedutil_rate_limit_us:
         description: "Default schedutil rate_limit_us (kosongkan untuk skip)"
         default: "500"
@@ -37,10 +40,21 @@ on:
         description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
         default: "https://github.com/riza220201/itel-rs4-kernel/raw/refs/heads/main/patches/bore-5.10-kmi.patch"
       kernelsu:
-        description: "KernelSU-Next: latest (tag stabil terbaru) / next (branch dev) / off"
+        description: "KernelSU: finasu / off"
         type: choice
-        options: [latest, next, off]
-        default: "latest"
+        options: [finasu, off]
+        default: "finasu"
+      finasu_ref:
+        description: "Branch/tag FinaSU (kosongkan = default branch)"
+        default: "release/v1.6.0"
+      susfs:
+        description: "SUSFS inline hook (butuh finasu): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      susfs_ref:
+        description: "Commit/tag susfs4ksu (branch gki-android12-5.10)"
+        default: "5436438"
       gaming_tweaks:
         description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
         type: choice
@@ -119,6 +133,64 @@ jobs:
             [ "$i" = 5 ] && { echo "::error::clone gagal 5x"; exit 1; }
             sleep $((i * 15))
           done
+
+      - name: Upgrade ke stable upstream
+        if: ${{ inputs.target_version != '' }}
+        env:
+          TARGET: ${{ inputs.target_version }}
+        run: |
+          cd kernel
+          echo "$TARGET" | grep -qE '^5\.10\.[0-9]+$' || { echo "::error::target_version harus 5.10.N"; exit 1; }
+          cur=$(sed -n 's/^SUBLEVEL = //p' Makefile | head -1)
+          tgt=${TARGET#5.10.}
+          echo "Source sekarang: 5.10.$cur -> target: 5.10.$tgt"
+          if [ "$cur" -ge "$tgt" ]; then
+            echo "Sudah di 5.10.$cur, upgrade dilewati"; exit 0
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/incr"
+          for n in $(seq $((cur+1)) "$tgt"); do
+            u="https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.$((n-1))-$n.xz"
+            curl -fL --retry 3 "$u" -o "$GITHUB_WORKSPACE/incr/$n.xz" \
+              || { echo "::warning::patch incremental $((n-1))->$n tidak ada, upgrade dibatalkan"; exit 0; }
+          done
+          for n in $(seq $((cur+1)) "$tgt"); do
+            xz -dc "$GITHUB_WORKSPACE/incr/$n.xz" | \
+              patch -p1 -N -F3 --no-backup-if-mismatch -s || true
+          done
+          rej=$(find . -name '*.rej' | wc -l)
+          if [ "$rej" -gt 0 ]; then
+            echo "::warning::$rej hunk ditolak (umumnya sudah ada di ACK/vendor tree). Daftar:"
+            find . -name '*.rej'
+            find . -name '*.rej' -delete
+          fi
+          find . -name '*.orig' -delete
+          sed -n '1,5p' Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+
+      - name: Apply SUSFS kernel patch
+        if: ${{ inputs.susfs == 'on' && inputs.kernelsu != 'off' }}
+        env:
+          REF: ${{ inputs.susfs_ref }}
+        run: |
+          cd kernel
+          ok=0
+          for src in https://gitlab.com/simonpunk/susfs4ksu.git https://github.com/Stashboy/susfs4ksu-mirror.git; do
+            rm -rf "$GITHUB_WORKSPACE/susfs"
+            if git clone -b gki-android12-5.10 "$src" "$GITHUB_WORKSPACE/susfs"; then ok=1; break; fi
+          done
+          [ "$ok" = 1 ] || { echo "::error::clone susfs4ksu gagal"; exit 1; }
+          if [ -n "$REF" ]; then git -C "$GITHUB_WORKSPACE/susfs" checkout "$REF"; fi
+          S="$GITHUB_WORKSPACE/susfs/kernel_patches"
+          echo "SUSFS: $(git -C "$GITHUB_WORKSPACE/susfs" log -1 --oneline)"
+          cp -rv "$S"/fs/. fs/
+          cp -rv "$S"/include/linux/. include/linux/
+          PF="$S/50_add_susfs_in_gki-android12-5.10.patch"
+          if ! patch -p1 -F3 --dry-run < "$PF" >/dev/null 2>&1; then
+            echo "::error::Patch SUSFS tidak cocok dengan source ini (kemungkinan karena upgrade ke 5.10.274 atau perbedaan tree). Dry-run:"
+            patch -p1 -F3 --dry-run < "$PF" | grep -E 'FAILED|rej|Hunk' | head -30 || true
+            exit 1
+          fi
+          patch -p1 -F3 --no-backup-if-mismatch < "$PF"
+          grep -rn "susfs" fs/Makefile include/linux/susfs.h 2>/dev/null | head -5 || true
 
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
@@ -250,12 +322,12 @@ jobs:
                           freq_qos_remove_request(&kz[first].boot_req);
                           goto next;
                       }
-                                if (min_floor_pct)
-                                    kz[first].floor_on = freq_qos_add_request(&p->constraints,
-                                            &kz[first].floor_req, FREQ_QOS_MIN,
-                                            p->cpuinfo.max_freq / 100 *
-                                            min_t(unsigned int, min_floor_pct, 100)) >= 0;
-                                kz[first].init = true;
+                      if (min_floor_pct)
+                          kz[first].floor_on = freq_qos_add_request(&p->constraints,
+                                  &kz[first].floor_req, FREQ_QOS_MIN,
+                                  p->cpuinfo.max_freq / 100 *
+                                  min_t(unsigned int, min_floor_pct, 100)) >= 0;
+                      kz[first].init = true;
                       pr_info("policy%u attached (max %u kHz)\n", first, kz[first].max_freq);
                   }
           next:
@@ -1067,19 +1139,28 @@ jobs:
               print('::warning::tcp_fastopen default tidak ditemukan, dilewati')
           PYEOF
 
-      - name: Integrate KernelSU-Next
-        if: ${{ inputs.kernelsu != 'off' }}
+      - name: Integrate FinaSU
+        if: ${{ inputs.kernelsu == 'finasu' }}
         run: |
           cd kernel
-          URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
-          if [ "${{ inputs.kernelsu }}" = "next" ]; then
-            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s next
-          else
-            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -
-          fi
+          REPO=https://github.com/LyraVoid/FinaSU
+          for i in 1 2 3; do
+            rm -rf FinaSU
+            if [ -n "${{ inputs.finasu_ref }}" ]; then
+              git clone -b "${{ inputs.finasu_ref }}" "$REPO" FinaSU && break
+            else
+              git clone "$REPO" FinaSU && break
+            fi
+            [ "$i" = 3 ] && { echo "::error::clone FinaSU gagal"; exit 1; }
+            sleep 10
+          done
+          [ -f FinaSU/kernel/Kconfig ] || { echo "::error::FinaSU/kernel/Kconfig tidak ada"; exit 1; }
+          ln -sfn ../FinaSU/kernel drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q kernelsu drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           ls -la drivers | grep -i kernelsu
-          git -C KernelSU-Next log -1 --oneline
-          git -C KernelSU-Next describe --tags --always
+          git -C FinaSU log -1 --oneline
+          git -C FinaSU describe --tags --always
 
       - name: Build
         run: |
@@ -1091,7 +1172,7 @@ jobs:
           set -e
           make $ARGS ${{ inputs.defconfig }}
           LVN="-Kaelltzyy"
-          if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-KSUN"; fi
+          if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-FinaSU"; fi
           scripts/config --file out/.config --set-str LOCALVERSION "$LVN" -d LOCALVERSION_AUTO
           if [ "${{ inputs.lto_mode }}" = "none" ]; then
             scripts/config --file out/.config \
@@ -1100,8 +1181,19 @@ jobs:
             scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN
           fi
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
-            scripts/config --file out/.config \
-              -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+            scripts/config --file out/.config -e KSU
+            if [ "${{ inputs.susfs }}" = "on" ]; then
+              # SUSFS inline hook: tanpa kprobes supaya tidak ada hook ganda
+              scripts/config --file out/.config -e KSU_SUSFS
+              for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
+                       KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+                if grep -rqE "^config $s\$" drivers/kernelsu fs init 2>/dev/null; then
+                  scripts/config --file out/.config -e "$s"
+                fi
+              done
+            else
+              scripts/config --file out/.config -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+            fi
           fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
@@ -1142,6 +1234,10 @@ jobs:
           grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
+            if [ "${{ inputs.susfs }}" = "on" ]; then
+              grep -E "^CONFIG_KSU_SUSFS" out/.config \
+                || { echo "::error::SUSFS tidak aktif di .config akhir"; exit 1; }
+            fi
           fi
           make $ARGS -j$(nproc) Image
           BEOF
@@ -1170,7 +1266,7 @@ jobs:
           cat > ak3/anykernel.sh <<'AKEOF'
           ### AnyKernel3 - Kaelltzyy GKI 5.10 (tanpa cek device, kernel saja)
           properties() { '
-          kernel.string=Kaelltzyy KSUN GKI 5.10
+          kernel.string=Kaelltzyy FinaSU GKI 5.10
           do.devicecheck=0
           do.modules=0
           do.systemless=0
@@ -1201,6 +1297,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Kaelltzyy-GKI-5.10
+          if-no-files-found: error
           path: |
             Kaelltzyy-GKI-5.10.zip
             kernel/out/arch/arm64/boot/Image
