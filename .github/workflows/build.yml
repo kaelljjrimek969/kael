@@ -41,6 +41,9 @@ on:
         type: choice
         options: [latest, next, off]
         default: "latest"
+      upstream_to:
+        description: "Upstream ke stable linux 5.10.X (isi angka sublevel, contoh 274; kosongkan untuk skip)"
+        default: "274"
       susfs:
         description: "SUSFS (hide root/mount/path). Butuh kernelsu != off"
         type: choice
@@ -130,6 +133,48 @@ jobs:
             [ "$i" = 5 ] && { echo "::error::clone gagal 5x"; exit 1; }
             sleep $((i * 15))
           done
+
+      - name: Upstream stable 5.10.y (best-effort)
+        if: ${{ inputs.upstream_to != '' }}
+        continue-on-error: true
+        env:
+          TARGET: ${{ inputs.upstream_to }}
+        run: |
+          cd kernel
+          T="${TARGET#5.10.}"
+          case "$T" in ''|*[!0-9]*) echo "::error::upstream_to harus angka sublevel, contoh 274"; exit 1;; esac
+          V=$(sed -n 's/^VERSION = //p' Makefile | head -1)
+          PL=$(sed -n 's/^PATCHLEVEL = //p' Makefile | head -1)
+          S=$(sed -n 's/^SUBLEVEL = //p' Makefile | head -1)
+          [ "$V.$PL" = "5.10" ] || { echo "::error::source bukan 5.10 ($V.$PL)"; exit 1; }
+          echo "Source sekarang: 5.10.$S -> target: 5.10.$T"
+          if [ "$S" -ge "$T" ]; then
+            echo "Source sudah >= target, skip"; exit 0
+          fi
+          W="$GITHUB_WORKSPACE/upstream"; rm -rf "$W"; mkdir -p "$W/stable"
+          git -C "$W/stable" init -q
+          fetch_tag() {
+            for U in https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+                     https://github.com/gregkh/linux.git; do
+              git -C "$W/stable" fetch -q --depth=1 --no-tags "$U" \
+                "refs/tags/v5.10.$1:refs/tags/v5.10.$1" && return 0
+            done
+            return 1
+          }
+          fetch_tag "$S" || { echo "::error::tag v5.10.$S tidak ketemu di mirror stable"; exit 1; }
+          fetch_tag "$T" || { echo "::error::tag v5.10.$T tidak ketemu di mirror stable"; exit 1; }
+          git -C "$W/stable" diff --binary --no-renames "v5.10.$S" "v5.10.$T" > "$W/upstream.patch"
+          echo "Patch upstream: $(du -h "$W/upstream.patch" | cut -f1), $(grep -c '^diff --git' "$W/upstream.patch") file"
+          if git apply --check "$W/upstream.patch" 2> "$W/check.log"; then
+            git apply "$W/upstream.patch"
+          else
+            echo "=== File yang konflik dengan source kamu ==="
+            grep -E '^error: patch failed' "$W/check.log" | sed 's/^error: patch failed: //' | cut -d: -f1 | sort | uniq -c | sort -rn | head -60
+            grep -E '^error: ' "$W/check.log" | grep -v 'patch failed' | head -30 || true
+            echo "::warning::Upstream ke 5.10.$T dibatalkan (konflik), source tidak diubah"
+            exit 1
+          fi
+          echo "Versi sekarang: $(make -s kernelversion)"
 
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
