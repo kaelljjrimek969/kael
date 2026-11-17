@@ -63,6 +63,9 @@ on:
       input_boost_pct:
         description: "Touch boost: persen max freq (1-100, kosongkan untuk skip)"
         default: "100"
+      spoof_temp_c:
+        description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
+        default: "15"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -127,8 +130,7 @@ jobs:
            *  - Sandevistan Boot: max CPU min-freq at boot, released after boot_boost_ms
            *  - Yamada input boost: CPU min-freq boost on touch
            *  - Multi target uname spoof: per-app uname release/version override
-           *  - Thermal disable + suhu spoof -15°C
-           *  - Battery temp spoof via /sys/module/power_supply/parameters/bat_spoof_temp
+           *  - Temp spoof (hanya tampilan ke userspace): suhu thermal zone + suhu baterai
            */
           #define pr_fmt(fmt) "kaelltzyy: " fmt
 
@@ -178,14 +180,15 @@ jobs:
           module_param(uname_all_apps, bool, 0644);
 
           /*
-           * bat_spoof_temp: nilai suhu baterai yang di-spoof ke userspace (0.1°C unit).
-           * Default -150 = -15.0°C. Tulis lewat:
-           *   echo -150 > /sys/module/power_supply/parameters/bat_spoof_temp
-           * Set 0 untuk disable spoof (pakai nilai asli dari driver).
+           * Spoof suhu HANYA di sisi tampilan (sysfs). Kernel (shutdown darurat,
+           * charger) tetap memakai suhu asli.
+           *   temp_spoof    : on/off
+           *   temp_spoof_mc : suhu yang ditampilkan, milli-Celsius (15000 = 15 C)
            */
-          static int bat_spoof_temp = -150;
-          module_param(bat_spoof_temp, int, 0644);
-          MODULE_PARM_DESC(bat_spoof_temp, "Battery temp spoof in 0.1C units (-150 = -15.0C, 0 = off)");
+          static bool temp_spoof = true;
+          module_param(temp_spoof, bool, 0644);
+          static int temp_spoof_mc = 15000;
+          module_param(temp_spoof_mc, int, 0644);
 
           struct kz_pol {
               struct freq_qos_request boot_req;
@@ -208,188 +211,20 @@ jobs:
           static struct cpumask kz_big_mask;
           static bool kz_have_big;
 
-          /* ── Battery temp spoof hook ─────────────────────────────────────
-           * Dipanggil dari power_supply_get_property() via notifier.
-           * Kalau bat_spoof_temp != 0 dan property == POWER_SUPPLY_PROP_TEMP,
-           * nilai val->intval di-override.
-           */
-          static int kz_psy_notifier_call(struct notifier_block *nb,
-                                          unsigned long event, void *data)
+          /* dipanggil dari drivers/thermal/thermal_sysfs.c (temp_show), satuan mC */
+          int kaelltzyy_zone_temp(int real)
           {
-              /* event = PSY_EVENT_PROP_CHANGED — kita intercept di get_property */
-              return NOTIFY_DONE;
+              if (!READ_ONCE(temp_spoof))
+                  return real;
+              return min(real, READ_ONCE(temp_spoof_mc));
           }
 
-          static struct notifier_block kz_psy_nb = {
-              .notifier_call = kz_psy_notifier_call,
-          };
-
-          /*
-           * Override power_supply_get_property untuk TEMP property.
-           * Teknik: wrap get_property dari setiap psy battery yang ketemu.
-           */
-          struct kz_psy_wrap {
-              struct power_supply          *psy;
-              const struct power_supply_desc *orig_desc;
-              struct power_supply_desc      wrap_desc;
-              int (*orig_get)(struct power_supply *,
-                              enum power_supply_property,
-                              union power_supply_propval *);
-          };
-
-          #define KZ_MAX_PSY 4
-          static struct kz_psy_wrap kz_psy[KZ_MAX_PSY];
-          static int kz_psy_n;
-          static DEFINE_MUTEX(kz_psy_lock);
-
-          static int kz_psy_get_property(struct power_supply *psy,
-                                         enum power_supply_property psp,
-                                         union power_supply_propval *val)
+          /* dipanggil dari drivers/power/supply/power_supply_sysfs.c, satuan 0.1 C */
+          int kaelltzyy_bat_temp(int real)
           {
-              int i, ret;
-              int (*orig)(struct power_supply *, enum power_supply_property,
-                          union power_supply_propval *) = NULL;
-
-              mutex_lock(&kz_psy_lock);
-              for (i = 0; i < kz_psy_n; i++) {
-                  if (kz_psy[i].psy == psy) {
-                      orig = kz_psy[i].orig_get;
-                      break;
-                  }
-              }
-              mutex_unlock(&kz_psy_lock);
-
-              if (!orig)
-                  return -ENODEV;
-
-              ret = orig(psy, psp, val);
-              if (ret)
-                  return ret;
-
-              if (psp == POWER_SUPPLY_PROP_TEMP && bat_spoof_temp != 0)
-                  val->intval = bat_spoof_temp;
-
-              return 0;
-          }
-
-          static void kz_bat_hook_fn(struct work_struct *w);
-          static DECLARE_DELAYED_WORK(kz_bat_work, kz_bat_hook_fn);
-
-          static void kz_bat_hook_fn(struct work_struct *w)
-          {
-              static const char * const names[] = {
-                  "battery", "Battery", "bms", "BAT", NULL
-              };
-              const char * const *np;
-              struct power_supply *psy;
-
-              mutex_lock(&kz_psy_lock);
-              for (np = names; *np && kz_psy_n < KZ_MAX_PSY; np++) {
-                  psy = power_supply_get_by_name(*np);
-                  if (!psy)
-                      continue;
-
-                  /* check sudah di-hook */
-                  int already = 0, j;
-                  for (j = 0; j < kz_psy_n; j++)
-                      if (kz_psy[j].psy == psy) { already = 1; break; }
-                  if (already) {
-                      power_supply_put(psy);
-                      continue;
-                  }
-
-                  /* simpan orig, pasang wrapper */
-                  kz_psy[kz_psy_n].psy       = psy;
-                  kz_psy[kz_psy_n].orig_desc  = psy->desc;
-                  kz_psy[kz_psy_n].orig_get   = psy->desc->get_property;
-                  /* copy desc lalu override get_property */
-                  memcpy(&kz_psy[kz_psy_n].wrap_desc, psy->desc,
-                         sizeof(struct power_supply_desc));
-                  kz_psy[kz_psy_n].wrap_desc.get_property = kz_psy_get_property;
-                  /* cast away const — runtime patch, best-effort */
-                  *(const struct power_supply_desc **)&psy->desc =
-                          &kz_psy[kz_psy_n].wrap_desc;
-                  pr_info("bat temp hook: %s (spoof=%d)\n", *np, bat_spoof_temp);
-                  kz_psy_n++;
-                  /* jangan power_supply_put — kita pegang referensinya */
-              }
-              mutex_unlock(&kz_psy_lock);
-
-              /* retry kalau belum ketemu semua, sampai 5 menit */
-              if (kz_psy_n == 0)
-                  schedule_delayed_work(&kz_bat_work, 10 * HZ);
-          }
-
-          /* ── Thermal spoof: semua zone → -15 000 mC ── */
-          static int kz_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
-          {
-              *temp = -15000; /* Kaelltzyy: spoof -15°C */
-              return 0;
-          }
-
-          static struct thermal_zone_device_ops kz_tz_ops = {
-              .get_temp = kz_thermal_get_temp,
-          };
-
-          static void kz_thermal_spoof_fn(struct work_struct *w);
-          static DECLARE_DELAYED_WORK(kz_thermal_work, kz_thermal_spoof_fn);
-
-          static void kz_thermal_spoof_fn(struct work_struct *w)
-          {
-              struct thermal_zone_device *tz;
-              int id;
-
-              for (id = 0; id < 32; id++) {
-                  char name[12];
-                  snprintf(name, sizeof(name), "thermal_zone%d", id);
-                  tz = thermal_zone_get_zone_by_name(name);
-                  if (IS_ERR_OR_NULL(tz))
-                      continue;
-                  tz->ops = &kz_tz_ops;
-              }
-              pr_info("thermal spoof applied (-15000 mc)\n");
-          }
-
-          /* ── Thermal core throttle noop via sysfs (best-effort) ── */
-          static struct delayed_work kz_thr_disable_work;
-
-          static void kz_thr_disable_fn(struct work_struct *w)
-          {
-              struct file *f;
-              loff_t pos = 0;
-              int zone, trip;
-              char path[80];
-
-              for (zone = 0; zone < 32; zone++) {
-                  for (trip = 0; trip < 16; trip++) {
-                      snprintf(path, sizeof(path),
-                               "/sys/class/thermal/thermal_zone%d/trip_point_%d_type",
-                               zone, trip);
-                      f = filp_open(path, O_RDONLY, 0);
-                      if (IS_ERR(f))
-                          break;
-                      filp_close(f, NULL);
-
-                      snprintf(path, sizeof(path),
-                               "/sys/class/thermal/cooling_device%d/cur_state",
-                               trip);
-                      f = filp_open(path, O_WRONLY, 0);
-                      if (!IS_ERR(f)) {
-                          kernel_write(f, "0", 1, &pos);
-                          filp_close(f, NULL);
-                          pos = 0;
-                      }
-                  }
-                  snprintf(path, sizeof(path),
-                           "/sys/class/thermal/thermal_zone%d/mode", zone);
-                  f = filp_open(path, O_WRONLY, 0);
-                  if (IS_ERR(f))
-                      continue;
-                  kernel_write(f, "disabled", 8, &pos);
-                  filp_close(f, NULL);
-                  pos = 0;
-              }
-              pr_info("thermal zones disabled via sysfs\n");
+              if (!READ_ONCE(temp_spoof))
+                  return real;
+              return min(real, READ_ONCE(temp_spoof_mc) / 100);
           }
 
           /* Attach QoS requests to every cpufreq policy that has appeared so far. */
@@ -693,16 +528,6 @@ jobs:
               INIT_DELAYED_WORK(&gpu_work, kz_gpu_fn);
               gpu_deadline = jiffies + 600 * HZ;
               schedule_delayed_work(&gpu_work, 30 * HZ);
-
-              /* Thermal: spoof -15°C + disable zones via sysfs */
-              INIT_DELAYED_WORK(&kz_thermal_work, kz_thermal_spoof_fn);
-              INIT_DELAYED_WORK(&kz_thr_disable_work, kz_thr_disable_fn);
-              schedule_delayed_work(&kz_thermal_work, 10 * HZ);
-              schedule_delayed_work(&kz_thr_disable_work, 15 * HZ);
-
-              /* Battery temp spoof */
-              INIT_DELAYED_WORK(&kz_bat_work, kz_bat_hook_fn);
-              schedule_delayed_work(&kz_bat_work, 20 * HZ);
 
               if (!boot_boost_ms)
                   boot_active = false;
@@ -1012,39 +837,74 @@ jobs:
           PYEOF
           grep -n "Kaelltzyy nodelay" net/ipv4/tcp.c
 
-      - name: Thermal disable + suhu spoof -15C (Kaelltzyy)
+      - name: Thermal - matikan throttling + spoof suhu tampilan (shutdown darurat tetap aktif)
         run: |
           cd kernel
 
           python3 - <<'PYEOF'
           import re
 
+          # 1) Matikan throttling (governor/cooling device) tapi biarkan
+          #    critical/hot trip, jadi shutdown darurat kernel tetap jalan.
           p = 'drivers/thermal/thermal_core.c'
           try:
               s = open(p).read()
           except FileNotFoundError:
-              print('::warning::thermal_core.c tidak ada, skip patch throttle'); exit(0)
-
-          if 'Kaelltzyy no-throttle' in s:
-              print('thermal_core sudah dipatch, skip'); exit(0)
-
-          n, c = re.subn(
-              r'(static void handle_thermal_trip\b[^{]*\{)',
-              r'\1\n\tif (1) return; /* Kaelltzyy no-throttle */',
-              s, count=1)
-          if c:
-              open(p, 'w').write(n)
-              print('ok    thermal_core handle_thermal_trip noop')
-          else:
-              n2, c2 = re.subn(
-                  r'(void __thermal_zone_device_update\b[^{]*\{)',
-                  r'\1\n\treturn; /* Kaelltzyy no-throttle */',
-                  s, count=1)
-              if c2:
-                  open(p, 'w').write(n2)
-                  print('ok    __thermal_zone_device_update noop (fallback)')
+              s = None
+              print('::warning::thermal_core.c tidak ada, skip')
+          if s is not None and 'Kaelltzyy no-throttle' not in s:
+              n, c = re.subn(r'(\n[ \t]*)handle_non_critical_trips\(([^;\n]*)\);',
+                             r'\1do { } while (0); /* Kaelltzyy no-throttle */', s, count=1)
+              if c:
+                  n = n.replace('static void handle_non_critical_trips(',
+                                'static void __maybe_unused handle_non_critical_trips(', 1)
+                  open(p, 'w').write(n)
+                  print('ok    throttling non-critical dimatikan (critical shutdown tetap)')
               else:
-                  print('::warning::handle_thermal_trip / __thermal_zone_device_update tidak ditemukan, dilewati')
+                  print('::warning::handle_non_critical_trips tidak ditemukan, throttling TIDAK dimatikan')
+
+          # 2) Spoof suhu thermal zone di tampilan sysfs (temp_show)
+          p = 'drivers/thermal/thermal_sysfs.c'
+          s = open(p).read()
+          if 'kaelltzyy_zone_temp' not in s:
+              i = s.find('temp_show(struct device *dev')
+              old = 'return sprintf(buf, "%d\\n", temperature);'
+              j = s.find(old, i) if i >= 0 else -1
+              if j >= 0:
+                  s = s[:j] + 'return sprintf(buf, "%d\\n", kaelltzyy_zone_temp(temperature));' + s[j + len(old):]
+                  decl = ('#ifdef CONFIG_KAELLTZYY\n'
+                          'extern int kaelltzyy_zone_temp(int real);\n'
+                          '#else\n'
+                          'static inline int kaelltzyy_zone_temp(int real) { return real; }\n'
+                          '#endif\n')
+                  k = list(re.finditer(r'^#include.*\n', s, re.M))[-1].end()
+                  s = s[:k] + decl + s[k:]
+                  open(p, 'w').write(s)
+                  print('ok    spoof suhu thermal zone (temp_show)')
+              else:
+                  print('::warning::temp_show tidak ditemukan, spoof suhu zone dilewati')
+
+          # 3) Spoof suhu baterai di tampilan sysfs/uevent
+          p = 'drivers/power/supply/power_supply_sysfs.c'
+          s = open(p).read()
+          if 'kaelltzyy_bat_temp' not in s:
+              i = s.find('power_supply_show_property(')
+              j = s.find('switch (psp) {', i) if i >= 0 else -1
+              if j >= 0:
+                  ins = ('if (psp == POWER_SUPPLY_PROP_TEMP)\n'
+                         '\t\tvalue.intval = kaelltzyy_bat_temp(value.intval);\n\n\t')
+                  s = s[:j] + ins + s[j:]
+                  decl = ('#ifdef CONFIG_KAELLTZYY\n'
+                          'extern int kaelltzyy_bat_temp(int real);\n'
+                          '#else\n'
+                          'static inline int kaelltzyy_bat_temp(int real) { return real; }\n'
+                          '#endif\n')
+                  k = list(re.finditer(r'^#include.*\n', s, re.M))[-1].end()
+                  s = s[:k] + decl + s[k:]
+                  open(p, 'w').write(s)
+                  print('ok    spoof suhu baterai (power_supply_show_property)')
+              else:
+                  print('::warning::power_supply_show_property tidak ditemukan, spoof baterai dilewati')
           PYEOF
 
           python3 - <<'PYEOF'
@@ -1069,12 +929,44 @@ jobs:
                   print('ok    mtk_thermal_set_user_scenarios noop ->', p)
                   break
           else:
-              print('::warning::mtk_thermal tidak ditemukan atau tidak cocok, skip')
+              print('mtk_thermal_set_user_scenarios tidak ada di source ini, skip')
           PYEOF
 
-          grep -c "kz_thermal_spoof_fn\|kz_thr_disable_fn\|kz_bat_hook_fn" drivers/misc/kaelltzyy.c \
-            && echo "thermal+bat hooks confirmed in kaelltzyy.c" \
-            || echo "::error::hooks tidak ditemukan di kaelltzyy.c"
+          # patch MTK di atas menyisipkan return sebelum deklarasi lokal
+          # (kernel dibuild dengan -Werror)
+          for f in drivers/misc/mediatek/thermal/mtk_thermal_monitor.c drivers/thermal/mtk_thermal.c; do
+            if [ -f "$f" ] && grep -q 'Kaelltzyy no-throttle' "$f"; then
+              d=$(dirname "$f"); o=$(basename "$f" .c).o
+              printf '\nCFLAGS_%s += -Wno-declaration-after-statement -Wno-unused-variable -Wno-unused-function\n' "$o" >> "$d/Makefile"
+            fi
+          done
+
+          grep -n "kaelltzyy_zone_temp\|kaelltzyy_bat_temp\|Kaelltzyy no-throttle" \
+            drivers/thermal/thermal_core.c drivers/thermal/thermal_sysfs.c \
+            drivers/power/supply/power_supply_sysfs.c || true
+
+      - name: Temp spoof default (suhu tampilan)
+        env:
+          C: ${{ inputs.spoof_temp_c }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          v = os.environ.get('C', '').strip()
+          if not v:
+              s = s.replace('static bool temp_spoof = true;', 'static bool temp_spoof = false;')
+              print('temp spoof dimatikan')
+          else:
+              n = max(-40, min(60, int(v)))
+              old = 'static int temp_spoof_mc = 15000;'
+              assert old in s
+              s = s.replace(old, 'static int temp_spoof_mc = %d;' % (n * 1000))
+              print('temp spoof default =', n, 'C')
+          open(p, 'w').write(s)
+          PYEOF
+          grep -n "temp_spoof" drivers/misc/kaelltzyy.c | head
 
       - name: Apply BORE patch
         if: ${{ inputs.bore_patch_url != '' }}
