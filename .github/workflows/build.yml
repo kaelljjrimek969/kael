@@ -41,9 +41,6 @@ on:
         type: choice
         options: [latest, next, off]
         default: "latest"
-      upstream_to:
-        description: "Upstream ke stable linux 5.10.X (isi angka sublevel, contoh 274; kosongkan untuk skip)"
-        default: "274"
       susfs:
         description: "SUSFS (hide root/mount/path). Butuh kernelsu != off"
         type: choice
@@ -80,6 +77,44 @@ on:
       spoof_temp_c:
         description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
         default: "15"
+      disable_debug:
+        description: "Matikan debug overhead kernel (DEBUG_INFO, lockdep, KASAN, dll): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      ram_gaming:
+        description: "Optimasi RAM gaming (watermark, init_on_alloc off, SPF): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      gaming_brutal:
+        description: "GAMING BRUTAL: kunci CPU idle latency saat sentuh layar dan saat game_mode (anti-jitter, boros baterai): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      game_mode_boot:
+        description: "game_mode langsung ON sejak boot (floor game + GPU lock + idle lock, tanpa modul; PANAS): on / off"
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      game_min_pct:
+        description: "Floor CPU saat game_mode, % dari max (1-100, kosongkan = bawaan 100)"
+        default: ""
+      eas_off:
+        description: "Matikan EAS (scheduler tidak hemat energi, tugas ke core cepat; panas + boros): on / off"
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      io_default:
+        description: "I/O scheduler default: auto (adios kalau patch ADIOS terpasang, kalau tidak kyber) / adios / kyber / none / keep (mq-deadline bawaan)"
+        type: choice
+        options: [auto, adios, kyber, none, keep]
+        default: "auto"
+      gaming_system:
+        description: "Gaming non CPU/GPU: IRQ wifi+UFS ke core besar, TCP latency saat download (TSQ 256K): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -133,54 +168,6 @@ jobs:
             [ "$i" = 5 ] && { echo "::error::clone gagal 5x"; exit 1; }
             sleep $((i * 15))
           done
-
-      - name: Upstream stable 5.10.y (best-effort)
-        if: ${{ inputs.upstream_to != '' }}
-        continue-on-error: true
-        env:
-          TARGET: ${{ inputs.upstream_to }}
-        run: |
-          cd kernel
-          T="${TARGET#5.10.}"
-          case "$T" in ''|*[!0-9]*) echo "::error::upstream_to harus angka sublevel, contoh 274"; exit 1;; esac
-          V=$(sed -n 's/^VERSION = //p' Makefile | head -1)
-          PL=$(sed -n 's/^PATCHLEVEL = //p' Makefile | head -1)
-          S=$(sed -n 's/^SUBLEVEL = //p' Makefile | head -1)
-          [ "$V.$PL" = "5.10" ] || { echo "::error::source bukan 5.10 ($V.$PL)"; exit 1; }
-          echo "Source sekarang: 5.10.$S -> target: 5.10.$T"
-          if [ "$S" -ge "$T" ]; then
-            echo "Source sudah >= target, skip"; exit 0
-          fi
-          W="$GITHUB_WORKSPACE/upstream"; rm -rf "$W"; mkdir -p "$W"
-          # Tag stable diambil langsung ke repo kernel supaya blob dasar tersedia untuk 3-way merge
-          fetch_tag() {
-            for U in https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-                     https://github.com/gregkh/linux.git; do
-              git fetch -q --depth=1 --no-tags "$U" "refs/tags/v5.10.$1:refs/tags/up-$1" && return 0
-            done
-            return 1
-          }
-          fetch_tag "$S" || { echo "::error::tag v5.10.$S tidak ketemu di mirror stable"; exit 1; }
-          fetch_tag "$T" || { echo "::error::tag v5.10.$T tidak ketemu di mirror stable"; exit 1; }
-          git diff --binary --no-renames "up-$S" "up-$T" > "$W/upstream.patch"
-          echo "Patch upstream: $(du -h "$W/upstream.patch" | cut -f1), $(grep -c '^diff --git' "$W/upstream.patch") file"
-          # 3-way merge: hunk yang sudah ada di source (cherry-pick ACK/vendor) dilewati otomatis,
-          # hanya konflik sungguhan yang tersisa
-          if git apply --3way "$W/upstream.patch" > "$W/apply.log" 2>&1; then
-            echo "Upstream ter-apply bersih"
-          else
-            grep -E '^(error|Applied|Falling|Using)' "$W/apply.log" | head -80 || true
-            CF=$(git diff --name-only --diff-filter=U)
-            echo "=== File konflik asli: $(echo "$CF" | grep -c .) ==="
-            for f in $CF; do echo "$(grep -c '^<<<<<<<' "$f") hunk  $f"; done
-            echo "=== Isi konflik (maks 900 baris) ==="
-            git diff | head -n 900 || true
-            git reset -q --hard HEAD
-            git clean -fdq
-            echo "::warning::Upstream ke 5.10.$T dibatalkan (ada konflik asli), source dikembalikan seperti semula"
-            exit 1
-          fi
-          echo "Versi sekarang: $(make -s kernelversion)"
 
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
@@ -706,6 +693,161 @@ jobs:
           python3 inject_kz.py
           grep -n kaelltzyy kernel/sys.c drivers/misc/Makefile | head
 
+      - name: Gaming brutal - idle latency lock (saat sentuh + game_mode)
+        if: ${{ inputs.gaming_brutal == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          need = ['static bool kz_have_big;',
+                  'kz_gpu_lock(on);',
+                  'if (input_register_handler(&kz_input_handler))',
+                  '/* GPU: lock min_freq ke max saat game mode',
+                  'mod_delayed_work(system_wq, &input_off_work, msecs_to_jiffies(input_boost_ms));']
+          m = re.search(r'(static void kz_input_off_fn\(struct work_struct \*w\)\n\{.*?)(\n\})', s, re.S)
+          if not (all(s.count(a) == 1 for a in need) and m and 'kz_lat_req' not in s):
+              print('::warning::anchor driver tidak cocok / sudah dipatch, idle latency lock dilewati')
+          else:
+              # 1) deklarasi (atas file)
+              s = s.replace('static bool kz_have_big;',
+                  'static bool kz_have_big;\n\n'
+                  'static unsigned int touch_latency_us = 100;\n'
+                  'module_param(touch_latency_us, uint, 0644);\n'
+                  'static struct pm_qos_request kz_touch_lat;\n'
+                  'static bool kz_lat_init;', 1)
+              # 2) touch boost selesai -> lepas latency lock
+              m = re.search(r'(static void kz_input_off_fn\(struct work_struct \*w\)\n\{.*?)(\n\})', s, re.S)
+              s = s[:m.end(1)] + ('\n\tif (kz_lat_init)\n'
+                  '\t\tcpu_latency_qos_update_request(&kz_touch_lat, PM_QOS_DEFAULT_VALUE);') + s[m.end(1):]
+              # 3) touch mulai -> kunci idle latency
+              k = 'mod_delayed_work(system_wq, &input_off_work, msecs_to_jiffies(input_boost_ms));'
+              s = s.replace(k, 'if (kz_lat_init)\n\t\tcpu_latency_qos_update_request(&kz_touch_lat, touch_latency_us);\n\t' + k, 1)
+              # 4) game_mode lock
+              g = '/* GPU: lock min_freq ke max saat game mode'
+              s = s.replace(g, 'static unsigned int game_latency_us = 100;\n'
+                  'module_param(game_latency_us, uint, 0644);\n'
+                  'static struct pm_qos_request kz_lat_req;\n\n' + g, 1)
+              s = s.replace('kz_gpu_lock(on);', 'kz_gpu_lock(on);\n\tif (kz_lat_init)\n'
+                  '\t\tcpu_latency_qos_update_request(&kz_lat_req,\n'
+                  '\t\t\ton ? game_latency_us : PM_QOS_DEFAULT_VALUE);', 1)
+              # 5) register request di init
+              i = 'if (input_register_handler(&kz_input_handler))'
+              s = s.replace(i, 'cpu_latency_qos_add_request(&kz_touch_lat, PM_QOS_DEFAULT_VALUE);\n'
+                  '\tcpu_latency_qos_add_request(&kz_lat_req, PM_QOS_DEFAULT_VALUE);\n'
+                  '\tkz_lat_init = true;\n\t' + i, 1)
+              open(p, 'w').write(s)
+              print('ok    idle latency lock: touch + game_mode')
+          PYEOF
+          grep -n "kz_lat\|kz_touch_lat\|latency_us" drivers/misc/kaelltzyy.c | head -30
+
+      - name: Game mode ON saat boot (tanpa modul) + floor game default
+        if: ${{ inputs.game_mode_boot == 'on' || inputs.game_min_pct != '' }}
+        env:
+          BOOT: ${{ inputs.game_mode_boot }}
+          PCT: ${{ inputs.game_min_pct }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          pct = os.environ.get('PCT', '').strip()
+          if pct:
+              n = max(1, min(100, int(pct)))
+              old = 'static unsigned int game_min_pct = 100;'
+              if old in s:
+                  s = s.replace(old, 'static unsigned int game_min_pct = %d;' % n, 1)
+                  print('ok    game_min_pct default =', n)
+              else:
+                  print('::warning::game_min_pct tidak ditemukan, dilewati')
+          if os.environ.get('BOOT') == 'on':
+              a1 = 'static bool game_mode;'
+              a2 = 'static int __init kz_init(void)'
+              a3 = 'INIT_DELAYED_WORK(&attach_work, kz_attach_fn);'
+              if all(s.count(a) == 1 for a in (a1, a2, a3)) and 'kz_game_set' in s:
+                  s = s.replace(a1, 'static bool game_mode = true;', 1)
+                  s = s.replace(a2, 'static struct delayed_work game_boot_work;\n\n'
+                      'static void kz_game_boot_fn(struct work_struct *w)\n{\n'
+                      '\tkz_game_set("1", NULL);\n}\n\n' + a2, 1)
+                  s = s.replace(a3, a3 + '\n\tINIT_DELAYED_WORK(&game_boot_work, kz_game_boot_fn);\n'
+                      '\tschedule_delayed_work(&game_boot_work, 45 * HZ);', 1)
+                  print('ok    game_mode ON saat boot (GPU lock + idle lock aktif +45 dtk)')
+              else:
+                  print('::warning::anchor game_mode_boot tidak cocok, dilewati')
+          open(p, 'w').write(s)
+          PYEOF
+          grep -n "game_mode = true\|game_boot\|game_min_pct =" drivers/misc/kaelltzyy.c | head
+
+      - name: EAS off (scheduler pilih core cepat, boros baterai)
+        if: ${{ inputs.eas_off == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          p = 'kernel/sched/topology.c'
+          try:
+              s = open(p).read()
+          except FileNotFoundError:
+              print('::warning::topology.c tidak ada, dilewati'); raise SystemExit
+          n, c = re.subn(r'(int\s+sysctl_sched_energy_aware\s*=\s*)1;', r'\g<1>0; /* Kaelltzyy */', s, count=1)
+          if c:
+              open(p, 'w').write(n); print('ok    sched_energy_aware default = 0')
+          else:
+              print('::warning::sysctl_sched_energy_aware tidak ditemukan, dilewati')
+          PYEOF
+          grep -n "Kaelltzyy" kernel/sched/topology.c | head -3
+
+      - name: Scan knob vendor (info, untuk tuning lanjutan)
+        run: |
+          cd kernel
+          {
+            echo "### module_param/sysfs terkait performa di source (nama saja)"
+            grep -rhoE 'module_param(_named|_cb)?\(\s*[A-Za-z0-9_]+' \
+              drivers/misc drivers/gpu drivers/devfreq drivers/cpufreq drivers/soc drivers/scsi/ufs \
+              drivers/thermal drivers/input kernel/sched 2>/dev/null \
+              | sed -E 's/.*\(\s*//' | grep -iE 'boost|fpsgo|perf|game|turbo|dvfs|dvfsrc|freq|idle|latency|ged|gpu|ufs|clkgate|hibern|thermal|cci|ddr|emi' \
+              | sort -u | head -300
+            echo
+            echo "### folder vendor MTK/Qcom yang ada"
+            ls -d drivers/misc/mediatek/* drivers/gpu/mediatek/* drivers/soc/mediatek/* drivers/soc/qcom/* 2>/dev/null | head -80
+            echo
+            echo "### UFS: clkgate / auto-hibern8 default"
+            grep -rnE 'clk_gating\.delay_ms\s*=|ahit\s*=|AUTO_HIBERN8' drivers/scsi/ufs/*.c 2>/dev/null | head -20
+          } > "$GITHUB_WORKSPACE/vendor-knobs.txt" 2>&1 || true
+          echo "::group::vendor-knobs.txt"; head -150 "$GITHUB_WORKSPACE/vendor-knobs.txt"; echo "::endgroup::"
+
+      - name: Gaming system - IRQ jaringan/UFS ke core besar + TCP latency
+        if: ${{ inputs.gaming_system == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          # 1) IRQ wifi + UFS ikut dipindah ke cluster besar (daftar di driver Kaelltzyy)
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          a = 'strstr(name, "synaptics"))'
+          if s.count(a) == 1 and '"ufshcd"' not in s:
+              s = s.replace(a, 'strstr(name, "synaptics") ||\n'
+                  '\t\t    strstr(name, "wlan") || strstr(name, "wifi") ||\n'
+                  '\t\t    strstr(name, "cnss") || strstr(name, "ufshcd"))', 1)
+              open(p, 'w').write(s)
+              print('ok    IRQ wlan/wifi/cnss/ufshcd -> cluster besar')
+          else:
+              print('::warning::daftar IRQ di driver tidak cocok, dilewati')
+          # 2) TCP small queues: 1MB -> 256KB (ping/lag stabil saat ada download)
+          p = 'net/ipv4/tcp_ipv4.c'
+          s = open(p).read()
+          n, c = re.subn(r'(sysctl_tcp_limit_output_bytes\s*=\s*)1048576;',
+                         r'\g<1>262144; /* Kaelltzyy */', s, count=1)
+          if c:
+              open(p, 'w').write(n); print('ok    tcp_limit_output_bytes=256K')
+          else:
+              print('::warning::tcp_limit_output_bytes tidak ditemukan, dilewati')
+          PYEOF
+          grep -n "Kaelltzyy" net/ipv4/tcp_ipv4.c | head -5
+
       - name: Yamada schedutil rate limit
         if: ${{ inputs.schedutil_rate_limit_us != '' }}
         run: |
@@ -933,6 +1075,34 @@ jobs:
           else:
               print('::warning::entry swappiness tidak ditemukan, clamp dilewati')
           PYEOF
+
+      - name: RAM gaming tuning (watermark, boost, compaction)
+        if: ${{ inputs.ram_gaming == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          def sub(path, pat, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print('::warning::file tidak ada:', path); return
+              n, c = re.subn(pat, repl, s, count=1)
+              if c:
+                  open(path, 'w').write(n); print('ok   ', label)
+              else:
+                  print('::warning::tidak ditemukan, dilewati:', label)
+          # kswapd bangun lebih awal -> kurangi direct reclaim (stall/lag spike saat game)
+          sub('mm/page_alloc.c', r'(int\s+watermark_scale_factor\s*=\s*)\d+;',
+              r'\g<1>25; /* Kaelltzyy */', 'watermark_scale_factor=25')
+          # matikan watermark boost: reclaim agresif setelah fragmentasi bikin frame drop
+          sub('mm/page_alloc.c', r'(watermark_boost_factor\s*(?:__read_mostly\s*)?=\s*)\d+;',
+              r'\g<1>0; /* Kaelltzyy */', 'watermark_boost_factor=0')
+          # proactive compaction = kerja CPU di background, tanpa THP di Android tidak perlu
+          sub('mm/compaction.c', r'(sysctl_compaction_proactiveness\s*=\s*)\d+;',
+              r'\g<1>0; /* Kaelltzyy */', 'compaction_proactiveness=0')
+          PYEOF
+          grep -nE "Kaelltzyy" mm/page_alloc.c mm/compaction.c | head
 
       - name: Turbo schedutil (extra frequency headroom)
         if: ${{ inputs.turbo_headroom != 'off' }}
@@ -1162,6 +1332,39 @@ jobs:
             echo "::warning::Patch ADIOS gagal dipasang (URL salah / tidak cocok), dilewati"
           fi
 
+      - name: Gaming IO - default I/O scheduler
+        if: ${{ inputs.io_default != 'keep' }}
+        env:
+          IOS: ${{ inputs.io_default }}
+        run: |
+          cd kernel
+          if [ "$IOS" = "auto" ]; then
+            if [ -f .applied_adios ]; then IOS=adios; else IOS=kyber; fi
+          fi
+          if [ "$IOS" = "adios" ] && [ ! -f .applied_adios ]; then
+            echo "::warning::io_default=adios tapi patch ADIOS tidak terpasang (isi adios_patch_url), pakai kyber"
+            IOS=kyber
+          fi
+          echo "I/O default dipilih: $IOS"
+          echo "$IOS" > .io_default
+          export IOS
+          python3 - <<'PYEOF'
+          import os, re
+          p = 'block/elevator.c'
+          try:
+              s = open(p).read()
+          except FileNotFoundError:
+              print('::warning::block/elevator.c tidak ada, dilewati'); raise SystemExit
+          name = os.environ['IOS']
+          n, c = re.subn(r'(elevator_get\(q,\s*)"mq-deadline"(,\s*false\))', r'\1"%s"\2' % name, s, count=1)
+          if c:
+              open(p, 'w').write(n)
+              print('ok    default I/O scheduler untuk single-queue =', name)
+          else:
+              print('::warning::elevator_get mq-deadline tidak ditemukan, I/O default dilewati')
+          PYEOF
+          grep -n 'elevator_get(q, "' block/elevator.c | head -3
+
       - name: Apply touch boost patch
         if: ${{ inputs.touch_boost_patch_url != '' }}
         run: |
@@ -1278,6 +1481,44 @@ jobs:
             # SPOOF_UNAME sengaja off: bentrok dengan uname spoof driver kaelltzyy
             scripts/config --file out/.config -d KSU_SUSFS_SPOOF_UNAME -d KSU_SUSFS_ENABLE_LOG
           fi
+          if [ "${{ inputs.disable_debug }}" = "on" ]; then
+            # DEBUG_INFO_BTF butuh DEBUG_INFO: kalau BTF aktif, DEBUG_INFO dibiarkan
+            if grep -q '^CONFIG_DEBUG_INFO_BTF=y' out/.config; then
+              echo "::warning::DEBUG_INFO_BTF aktif di defconfig, DEBUG_INFO dibiarkan (BTF butuh itu)"
+            else
+              scripts/config --file out/.config \
+                -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_DWARF5 \
+                -d DEBUG_INFO_REDUCED -d DEBUG_INFO_SPLIT -e DEBUG_INFO_NONE
+            fi
+            scripts/config --file out/.config \
+              -d KASAN -d UBSAN -d KCSAN -d KFENCE -d DEBUG_KMEMLEAK \
+              -d PROVE_LOCKING -d LOCKDEP -d DEBUG_LOCK_ALLOC -d LOCK_STAT \
+              -d DEBUG_SPINLOCK -d DEBUG_MUTEXES -d DEBUG_RT_MUTEXES \
+              -d DEBUG_WW_MUTEX_SLOWPATH -d DEBUG_ATOMIC_SLEEP -d DEBUG_PREEMPT \
+              -d DEBUG_LIST -d DEBUG_SG -d DEBUG_NOTIFIERS -d DEBUG_CREDENTIALS \
+              -d DEBUG_OBJECTS -d DEBUG_VM -d DEBUG_PAGEALLOC -d DEBUG_STACK_USAGE \
+              -d PAGE_OWNER -d PAGE_POISONING -d SLUB_DEBUG_ON -d SCHEDSTATS \
+              -d LATENCYTOP -d PM_DEBUG -d PM_ADVANCED_DEBUG -d DEBUG_SHIRQ \
+              -d WQ_WATCHDOG -d SOFTLOCKUP_DETECTOR -d HARDLOCKUP_DETECTOR \
+              -d PANIC_ON_OOPS -d BUG_ON_DATA_CORRUPTION -d DEBUG_PI_LIST \
+              -d SLUB_DEBUG -d ZRAM_MEMORY_TRACKING
+          fi
+          if [ "${{ inputs.ram_gaming }}" = "on" ]; then
+            # PSI wajib untuk lmkd Android; init_on_alloc/free = zero-fill tiap alokasi (overhead CPU + bandwidth RAM)
+            scripts/config --file out/.config \
+              -e PSI -e MEMCG \
+              -d INIT_ON_ALLOC_DEFAULT_ON -d INIT_ON_FREE_DEFAULT_ON \
+              -d SHUFFLE_PAGE_ALLOCATOR
+            # Speculative page fault: page fault tanpa mmap_lock (hanya kalau source punya)
+            if grep -q '^config SPECULATIVE_PAGE_FAULT' mm/Kconfig; then
+              scripts/config --file out/.config -e SPECULATIVE_PAGE_FAULT
+            else
+              echo "::warning::SPECULATIVE_PAGE_FAULT tidak ada di source ini, dilewati"
+            fi
+          fi
+          if [ "$(cat .io_default 2>/dev/null)" = "kyber" ]; then
+            scripts/config --file out/.config -e MQ_IOSCHED_KYBER
+          fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
           scripts/config --file out/.config -e ZRAM -e CRYPTO_LZ4 \
@@ -1308,6 +1549,7 @@ jobs:
           make $ARGS olddefconfig
           grep -E "^CONFIG_(LRU_GEN|TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
+          grep -E "^CONFIG_(INIT_ON_ALLOC_DEFAULT_ON|INIT_ON_FREE_DEFAULT_ON|SPECULATIVE_PAGE_FAULT|PSI|SLUB_DEBUG|DEBUG_INFO)[= ]" out/.config || true
           if grep -q '^CONFIG_LRU_GEN=y' out/.config; then
             echo "MGLRU AKTIF: $(grep -E '^CONFIG_LRU_GEN(_ENABLED)?=' out/.config | tr '\n' ' ')"
           else
@@ -1391,6 +1633,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Kaelltzyy-GKI-5.10
+          if-no-files-found: error
           path: |
             Kaelltzyy-GKI-5.10.zip
+            vendor-knobs.txt
             kernel/out/arch/arm64/boot/Image
