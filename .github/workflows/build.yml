@@ -45,8 +45,8 @@ on:
         options: [finasu, off]
         default: "finasu"
       finasu_ref:
-        description: "Branch/tag FinaSU (kosongkan = default branch)"
-        default: "release/v1.4.3"
+        description: "Tag/branch FinaSU, mis. v1.4.3 atau v1.6.0 (kosongkan = master)"
+        default: "v1.4.3"
       susfs:
         description: "SUSFS inline hook (butuh finasu): on / off"
         type: choice
@@ -1158,7 +1158,11 @@ jobs:
             else
               git clone "$REPO" FinaSU && break
             fi
-            [ "$i" = 3 ] && { echo "::error::clone FinaSU gagal"; exit 1; }
+            if [ "$i" = 3 ]; then
+              echo "::error::clone FinaSU gagal. Ref yang tersedia (tag/branch terakhir):"
+              git ls-remote --tags --heads "$REPO" | awk '{print $2}' | sed 's|refs/||' | sort -V | tail -25
+              exit 1
+            fi
             sleep 10
           done
           [ -f FinaSU/kernel/Kconfig ] || { echo "::error::FinaSU/kernel/Kconfig tidak ada"; exit 1; }
