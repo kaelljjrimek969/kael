@@ -40,21 +40,10 @@ on:
         description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
         default: "https://github.com/riza220201/itel-rs4-kernel/raw/refs/heads/main/patches/bore-5.10-kmi.patch"
       kernelsu:
-        description: "KernelSU: finasu / off"
+        description: "KernelSU-Next: latest (tag stabil terbaru) / next (branch dev) / off"
         type: choice
-        options: [finasu, off]
-        default: "finasu"
-      finasu_ref:
-        description: "Tag/branch FinaSU, mis. v1.4.3 atau v1.6.0 (kosongkan = master)"
-        default: "v1.4.3"
-      susfs:
-        description: "SUSFS inline hook (butuh finasu): on / off"
-        type: choice
-        options: ["on", "off"]
-        default: "on"
-      susfs_ref:
-        description: "Commit/tag susfs4ksu (branch gki-android12-5.10)"
-        default: "b0e4746"
+        options: [latest, next, off]
+        default: "latest"
       gaming_tweaks:
         description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
         type: choice
@@ -80,6 +69,11 @@ on:
       spoof_temp_c:
         description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
         default: "15"
+      disable_debug:
+        description: "Matikan debug overhead kernel (DEBUG_INFO, lockdep, KASAN, dll): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -165,39 +159,6 @@ jobs:
           fi
           find . -name '*.orig' -delete
           sed -n '1,5p' Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
-
-      - name: Apply SUSFS kernel patch
-        if: ${{ inputs.susfs == 'on' && inputs.kernelsu != 'off' }}
-        env:
-          REF: ${{ inputs.susfs_ref }}
-        run: |
-          cd kernel
-          if [ -f fs/susfs.c ] || grep -q susfs fs/namei.c 2>/dev/null; then
-            echo "::warning::Source ini SUDAH mengandung SUSFS, patch dilewati (tidak ditimpa)"
-            ls -la fs/susfs.c include/linux/susfs*.h 2>/dev/null || true
-            grep -rhE 'SUSFS_VERSION|SUSFS_VARIANT' include/linux/susfs*.h 2>/dev/null | head || true
-            grep -rln susfs fs include kernel 2>/dev/null | head -40 || true
-            exit 0
-          fi
-          ok=0
-          for src in https://gitlab.com/simonpunk/susfs4ksu.git https://github.com/Stashboy/susfs4ksu-mirror.git; do
-            rm -rf "$GITHUB_WORKSPACE/susfs"
-            if git clone -b gki-android12-5.10 "$src" "$GITHUB_WORKSPACE/susfs"; then ok=1; break; fi
-          done
-          [ "$ok" = 1 ] || { echo "::error::clone susfs4ksu gagal"; exit 1; }
-          if [ -n "$REF" ]; then git -C "$GITHUB_WORKSPACE/susfs" checkout "$REF"; fi
-          S="$GITHUB_WORKSPACE/susfs/kernel_patches"
-          echo "SUSFS: $(git -C "$GITHUB_WORKSPACE/susfs" log -1 --oneline)"
-          cp -rv "$S"/fs/. fs/
-          cp -rv "$S"/include/linux/. include/linux/
-          PF="$S/50_add_susfs_in_gki-android12-5.10.patch"
-          if ! patch -p1 -F3 --dry-run < "$PF" >/dev/null 2>&1; then
-            echo "::error::Patch SUSFS tidak cocok dengan source ini (kemungkinan karena upgrade ke 5.10.274 atau perbedaan tree). Dry-run:"
-            patch -p1 -F3 --dry-run < "$PF" | head -80 || true
-            exit 1
-          fi
-          patch -p1 -F3 --no-backup-if-mismatch < "$PF"
-          grep -rn "susfs" fs/Makefile include/linux/susfs.h 2>/dev/null | head -5 || true
 
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
@@ -1146,32 +1107,19 @@ jobs:
               print('::warning::tcp_fastopen default tidak ditemukan, dilewati')
           PYEOF
 
-      - name: Integrate FinaSU
-        if: ${{ inputs.kernelsu == 'finasu' }}
+      - name: Integrate KernelSU-Next
+        if: ${{ inputs.kernelsu != 'off' }}
         run: |
           cd kernel
-          REPO=https://github.com/LyraVoid/FinaSU
-          for i in 1 2 3; do
-            rm -rf FinaSU
-            if [ -n "${{ inputs.finasu_ref }}" ]; then
-              git clone -b "${{ inputs.finasu_ref }}" "$REPO" FinaSU && break
-            else
-              git clone "$REPO" FinaSU && break
-            fi
-            if [ "$i" = 3 ]; then
-              echo "::error::clone FinaSU gagal. Ref yang tersedia (tag/branch terakhir):"
-              git ls-remote --tags --heads "$REPO" | awk '{print $2}' | sed 's|refs/||' | sort -V | tail -25
-              exit 1
-            fi
-            sleep 10
-          done
-          [ -f FinaSU/kernel/Kconfig ] || { echo "::error::FinaSU/kernel/Kconfig tidak ada"; exit 1; }
-          ln -sfn ../FinaSU/kernel drivers/kernelsu
-          grep -q kernelsu drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          grep -q kernelsu drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+          if [ "${{ inputs.kernelsu }}" = "next" ]; then
+            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s next
+          else
+            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -
+          fi
           ls -la drivers | grep -i kernelsu
-          git -C FinaSU log -1 --oneline
-          git -C FinaSU describe --tags --always
+          git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next describe --tags --always
 
       - name: Build
         run: |
@@ -1183,7 +1131,7 @@ jobs:
           set -e
           make $ARGS ${{ inputs.defconfig }}
           LVN="-Kaelltzyy"
-          if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-FinaSU"; fi
+          if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-KSUN"; fi
           scripts/config --file out/.config --set-str LOCALVERSION "$LVN" -d LOCALVERSION_AUTO
           if [ "${{ inputs.lto_mode }}" = "none" ]; then
             scripts/config --file out/.config \
@@ -1192,19 +1140,29 @@ jobs:
             scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN
           fi
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
-            scripts/config --file out/.config -e KSU
-            if [ "${{ inputs.susfs }}" = "on" ]; then
-              # SUSFS inline hook: tanpa kprobes supaya tidak ada hook ganda
-              scripts/config --file out/.config -e KSU_SUSFS
-              for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
-                       KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
-                if grep -rqE "^config $s\$" drivers/kernelsu fs init kernel 2>/dev/null; then
-                  scripts/config --file out/.config -e "$s"
-                fi
-              done
+            scripts/config --file out/.config \
+              -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+          fi
+          if [ "${{ inputs.disable_debug }}" = "on" ]; then
+            # DEBUG_INFO_BTF butuh DEBUG_INFO: kalau BTF aktif, DEBUG_INFO dibiarkan
+            if grep -q '^CONFIG_DEBUG_INFO_BTF=y' out/.config; then
+              echo "::warning::DEBUG_INFO_BTF aktif di defconfig, DEBUG_INFO dibiarkan (BTF butuh itu)"
             else
-              scripts/config --file out/.config -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+              scripts/config --file out/.config \
+                -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_DWARF5 \
+                -d DEBUG_INFO_REDUCED -d DEBUG_INFO_SPLIT -e DEBUG_INFO_NONE
             fi
+            scripts/config --file out/.config \
+              -d KASAN -d UBSAN -d KCSAN -d KFENCE -d DEBUG_KMEMLEAK \
+              -d PROVE_LOCKING -d LOCKDEP -d DEBUG_LOCK_ALLOC -d LOCK_STAT \
+              -d DEBUG_SPINLOCK -d DEBUG_MUTEXES -d DEBUG_RT_MUTEXES \
+              -d DEBUG_WW_MUTEX_SLOWPATH -d DEBUG_ATOMIC_SLEEP -d DEBUG_PREEMPT \
+              -d DEBUG_LIST -d DEBUG_SG -d DEBUG_NOTIFIERS -d DEBUG_CREDENTIALS \
+              -d DEBUG_OBJECTS -d DEBUG_VM -d DEBUG_PAGEALLOC -d DEBUG_STACK_USAGE \
+              -d PAGE_OWNER -d PAGE_POISONING -d SLUB_DEBUG_ON -d SCHEDSTATS \
+              -d LATENCYTOP -d PM_DEBUG -d PM_ADVANCED_DEBUG -d DEBUG_SHIRQ \
+              -d WQ_WATCHDOG -d SOFTLOCKUP_DETECTOR -d HARDLOCKUP_DETECTOR \
+              -d PANIC_ON_OOPS -d BUG_ON_DATA_CORRUPTION -d DEBUG_PI_LIST
           fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
@@ -1235,6 +1193,7 @@ jobs:
           make $ARGS olddefconfig
           grep -E "^CONFIG_(LRU_GEN|TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
+          grep -cE "^CONFIG_(DEBUG_INFO|KASAN|LOCKDEP|PROVE_LOCKING|DEBUG_SPINLOCK|DEBUG_MUTEXES)=y" out/.config || true
           if grep -q '^CONFIG_LRU_GEN=y' out/.config; then
             echo "MGLRU AKTIF: $(grep -E '^CONFIG_LRU_GEN(_ENABLED)?=' out/.config | tr '\n' ' ')"
           else
@@ -1245,10 +1204,6 @@ jobs:
           grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
-            if [ "${{ inputs.susfs }}" = "on" ]; then
-              grep -E "^CONFIG_KSU_SUSFS" out/.config \
-                || { echo "::error::SUSFS tidak aktif di .config akhir"; exit 1; }
-            fi
           fi
           make $ARGS -j$(nproc) Image
           BEOF
@@ -1277,7 +1232,7 @@ jobs:
           cat > ak3/anykernel.sh <<'AKEOF'
           ### AnyKernel3 - Kaelltzyy GKI 5.10 (tanpa cek device, kernel saja)
           properties() { '
-          kernel.string=Kaelltzyy FinaSU GKI 5.10
+          kernel.string=Kaelltzyy KSUN GKI 5.10
           do.devicecheck=0
           do.modules=0
           do.systemless=0
