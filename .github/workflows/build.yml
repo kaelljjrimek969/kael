@@ -155,6 +155,11 @@ jobs:
           if [ "$rej" -gt 0 ]; then
             echo "::warning::$rej hunk ditolak (umumnya sudah ada di ACK/vendor tree). Daftar:"
             find . -name '*.rej'
+            for r in $(find . -name '*.rej' | sort); do
+              echo "::group::REJECT $r"
+              cat "$r"
+              echo "::endgroup::"
+            done
             find . -name '*.rej' -delete
           fi
           find . -name '*.orig' -delete
