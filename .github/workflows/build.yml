@@ -160,6 +160,26 @@ jobs:
           find . -name '*.orig' -delete
           sed -n '1,5p' Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
 
+      - name: Fix duplikat f2fs_gc_kthread (efek upgrade stable)
+        if: ${{ inputs.target_version != '' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          f, g = 'fs/f2fs/f2fs.h', 'fs/f2fs/gc.h'
+          pat = re.compile(r'struct f2fs_gc_kthread \{.*?\n\};\n', re.S)
+          try:
+              fs, gs = open(f).read(), open(g).read()
+          except FileNotFoundError:
+              print('f2fs tidak ada, skip'); raise SystemExit
+          if pat.search(fs) and pat.search(gs):
+              open(g, 'w').write(pat.sub('', gs, count=1))
+              print('ok    struct f2fs_gc_kthread duplikat dihapus dari gc.h')
+          else:
+              print('tidak ada duplikat f2fs_gc_kthread')
+          PYEOF
+          grep -n "struct f2fs_gc_kthread {" fs/f2fs/*.h
+
       - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
           cd kernel
