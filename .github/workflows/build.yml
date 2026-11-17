@@ -172,6 +172,13 @@ jobs:
           REF: ${{ inputs.susfs_ref }}
         run: |
           cd kernel
+          if [ -f fs/susfs.c ] || grep -q susfs fs/namei.c 2>/dev/null; then
+            echo "::warning::Source ini SUDAH mengandung SUSFS, patch dilewati (tidak ditimpa)"
+            ls -la fs/susfs.c include/linux/susfs*.h 2>/dev/null || true
+            grep -rhE 'SUSFS_VERSION|SUSFS_VARIANT' include/linux/susfs*.h 2>/dev/null | head || true
+            grep -rln susfs fs include kernel 2>/dev/null | head -40 || true
+            exit 0
+          fi
           ok=0
           for src in https://gitlab.com/simonpunk/susfs4ksu.git https://github.com/Stashboy/susfs4ksu-mirror.git; do
             rm -rf "$GITHUB_WORKSPACE/susfs"
@@ -1187,7 +1194,7 @@ jobs:
               scripts/config --file out/.config -e KSU_SUSFS
               for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
                        KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
-                if grep -rqE "^config $s\$" drivers/kernelsu fs init 2>/dev/null; then
+                if grep -rqE "^config $s\$" drivers/kernelsu fs init kernel 2>/dev/null; then
                   scripts/config --file out/.config -e "$s"
                 fi
               done
