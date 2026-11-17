@@ -12,9 +12,9 @@ on:
       defconfig:
         description: "Defconfig"
         default: "gki_defconfig"
-      advanced_options:
-        description: "Advanced numeric settings (JSON): schedutil_rate_limit_us, input_boost_ms, input_boost_pct, min_floor_pct, gpu_floor_pct, spoof_temp_c, game_min_pct"
-        default: '{"schedutil_rate_limit_us":"500","input_boost_ms":"300","input_boost_pct":"100","min_floor_pct":"50","gpu_floor_pct":"50","spoof_temp_c":"15","game_min_pct":""}'
+      schedutil_rate_limit_us:
+        description: "Default schedutil rate_limit_us (kosongkan untuk skip)"
+        default: "500"
       zram_size_gb:
         description: "Ukuran ZRAM dipaksa (GB, 0 atau kosong untuk skip)"
         default: "4"
@@ -62,6 +62,21 @@ on:
         type: choice
         options: ["off", "on"]
         default: "on"
+      gpu_floor_pct:
+        description: "GPU Mali: lantai frekuensi min, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
+      min_floor_pct:
+        description: "EXTREME: lantai frekuensi min CPU permanen, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
+      input_boost_ms:
+        description: "Durasi touch boost default (ms, kosongkan untuk skip)"
+        default: "300"
+      input_boost_pct:
+        description: "Touch boost: persen max freq (1-100, kosongkan untuk skip)"
+        default: "100"
+      spoof_temp_c:
+        description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
+        default: "15"
       disable_debug:
         description: "Matikan debug overhead kernel (DEBUG_INFO, lockdep, KASAN, dll): on / off"
         type: choice
@@ -82,6 +97,9 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      game_min_pct:
+        description: "Floor CPU saat game_mode, % dari max (1-100, kosongkan = bawaan 100)"
+        default: ""
       eas_off:
         description: "Matikan EAS (scheduler tidak hemat energi, tugas ke core cepat; panas + boros): on / off"
         type: choice
@@ -725,10 +743,10 @@ jobs:
           grep -n "kz_lat\|kz_touch_lat\|latency_us" drivers/misc/kaelltzyy.c | head -30
 
       - name: Game mode ON saat boot (tanpa modul) + floor game default
-        if: ${{ inputs.game_mode_boot == 'on' || fromJSON(inputs.advanced_options).game_min_pct != '' }}
+        if: ${{ inputs.game_mode_boot == 'on' || inputs.game_min_pct != '' }}
         env:
           BOOT: ${{ inputs.game_mode_boot }}
-          PCT: ${{ fromJSON(inputs.advanced_options).game_min_pct }}
+          PCT: ${{ inputs.game_min_pct }}
         run: |
           cd kernel
           python3 - <<'PYEOF'
@@ -831,13 +849,13 @@ jobs:
           grep -n "Kaelltzyy" net/ipv4/tcp_ipv4.c | head -5
 
       - name: Yamada schedutil rate limit
-        if: ${{ fromJSON(inputs.advanced_options).schedutil_rate_limit_us != '' }}
+        if: ${{ inputs.schedutil_rate_limit_us != '' }}
         run: |
           cd kernel
           f=kernel/sched/cpufreq_schedutil.c
           pat='tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);'
           if grep -qF "$pat" "$f"; then
-            sed -i "s|tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);|tunables->rate_limit_us = ${{ fromJSON(inputs.advanced_options).schedutil_rate_limit_us }};|" "$f"
+            sed -i "s|tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);|tunables->rate_limit_us = ${{ inputs.schedutil_rate_limit_us }};|" "$f"
             grep -n "rate_limit_us = " "$f"
           else
             echo "::warning::Baris rate_limit_us tidak ditemukan, dilewati"
@@ -862,10 +880,10 @@ jobs:
           PYEOF
 
       - name: Touch boost defaults (Yamada)
-        if: ${{ fromJSON(inputs.advanced_options).input_boost_ms != '' || fromJSON(inputs.advanced_options).input_boost_pct != '' }}
+        if: ${{ inputs.input_boost_ms != '' || inputs.input_boost_pct != '' }}
         env:
-          MS: ${{ fromJSON(inputs.advanced_options).input_boost_ms }}
-          PCT: ${{ fromJSON(inputs.advanced_options).input_boost_pct }}
+          MS: ${{ inputs.input_boost_ms }}
+          PCT: ${{ inputs.input_boost_pct }}
         run: |
           cd kernel
           python3 - <<'PYEOF'
@@ -887,9 +905,9 @@ jobs:
           grep -nE "input_boost_(ms|pct) =" drivers/misc/kaelltzyy.c
 
       - name: Min freq floor default (extreme)
-        if: ${{ fromJSON(inputs.advanced_options).min_floor_pct != '' && fromJSON(inputs.advanced_options).min_floor_pct != '0' }}
+        if: ${{ inputs.min_floor_pct != '' && inputs.min_floor_pct != '0' }}
         env:
-          PCT: ${{ fromJSON(inputs.advanced_options).min_floor_pct }}
+          PCT: ${{ inputs.min_floor_pct }}
         run: |
           cd kernel
           python3 - <<'PYEOF'
@@ -905,9 +923,9 @@ jobs:
           PYEOF
 
       - name: GPU floor default
-        if: ${{ fromJSON(inputs.advanced_options).gpu_floor_pct != '' && fromJSON(inputs.advanced_options).gpu_floor_pct != '0' }}
+        if: ${{ inputs.gpu_floor_pct != '' && inputs.gpu_floor_pct != '0' }}
         env:
-          PCT: ${{ fromJSON(inputs.advanced_options).gpu_floor_pct }}
+          PCT: ${{ inputs.gpu_floor_pct }}
         run: |
           cd kernel
           python3 - <<'PYEOF'
@@ -1229,7 +1247,7 @@ jobs:
 
       - name: Temp spoof default (suhu tampilan)
         env:
-          C: ${{ fromJSON(inputs.advanced_options).spoof_temp_c }}
+          C: ${{ inputs.spoof_temp_c }}
         run: |
           cd kernel
           python3 - <<'PYEOF'
